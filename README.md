@@ -14,8 +14,8 @@ The first screen asks where the system configuration comes from.
 
 | Source | What you get |
 |---|---|
-| **Starter template** (default) | A complete flake for your first NixOS host, written to `~/nixos-config` with the first git commit made. You own it; nothing of the author's is in it. |
-| **Linuxury's config** | The author's own setup. The wizard clones it, adds this machine's disk layout and commits that. |
+| **Starter template** (default) | A complete flake for your first NixOS host, written to `~/nixos-config` with the first git commit made. You own it; none of my own setup is in it. |
+| **Linuxury's config** | My own setup (desktops, services, secrets), made for my machines. The wizard clones it, adds this machine's disk layout and commits that. |
 
 Another repo can be used with `INSTALLER_GIT=<url>`.
 

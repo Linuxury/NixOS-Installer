@@ -12,7 +12,7 @@
 #
 # Two config sources (first screen):
 #   Starter template  a fresh first host: the wizard writes a complete flake you own
-#   Linuxury's config the author's own NixOS setup (clones it, adds the disk layout)
+#   Linuxury's config my own NixOS setup (clones it, adds the disk layout)
 #
 # Usage:
 #   sudo nix run github:Linuxury/NixOS-Installer          # on the ISO: install
@@ -1268,9 +1268,9 @@ load_config() {
 
 step_source() {
   panel "Where should the system configuration come from?" "$(box -t "Config source" \
-    "Starter template   Nothing of the author's: you get a complete NixOS flake for a first host," \
+    "Starter template   None of my setup: you get a complete NixOS flake for a first host," \
     "                   written to your home folder with the first git commit already made." \
-    "Linuxury's config  The author's own setup (desktops, services, secrets) for his machines." \
+    "Linuxury's config  My own setup (desktops, services, secrets), made for my machines." \
     "                   Clones it and adds this machine's disk layout.")"
   pick SOURCE "" "Starter template ★   a fresh first host; you own the result|starter" \
                  "Linuxury's config   my own setup, tuned for my machines|linuxury" || return 1
