@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ===========================================================================
-# scripts/install.sh — NixOS installer for this flake (with a demo mode)
+# install.sh — guided NixOS installer (with a demo mode)
 #
 # Real mode partitions, formats and installs. It runs as root, only on the
 # live ISO, never wipes a mounted disk, and asks you to type the hostname.
@@ -10,11 +10,15 @@
 # Demo mode runs every menu and prints the disk.nix and the exact commands
 # the real mode would run — touching nothing.
 #
+# Two config sources (first screen):
+#   Starter template  a fresh first host: the wizard writes a complete flake you own
+#   Linuxury's config the author's own NixOS setup (clones it, adds the disk layout)
+#
 # Usage:
-#   sudo nix run github:Linuxury/nixos-config#install    # on the ISO: install
-#   sudo nix run github:Linuxury/nixos-config#install -- --resume
-#   nix run .#install-demo                               # demo, your real disks
-#   nix run .#install-demo -- --fake-disks 3-mixed       # demo, fake disks:
+#   sudo nix run github:Linuxury/NixOS-Installer          # on the ISO: install
+#   sudo nix run github:Linuxury/NixOS-Installer -- --resume
+#   nix run .#install-demo                                # demo, your real disks
+#   nix run .#install-demo -- --fake-disks 3-mixed        # demo, fake disks:
 #        2-equal · 3-mixed · 4-hdd · windows
 #
 # v1 real mode: btrfs/ext4/xfs · LUKS · systemd-boot/GRUB/Limine · single disk,
@@ -31,7 +35,8 @@ if ! command -v gum >/dev/null || ! command -v qrencode >/dev/null || ! command 
 fi
 { : </dev/tty; } 2>/dev/null || [[ -n ${INSTALL_TEST:-} ]] || { echo "the installer needs an interactive terminal" >&2; exit 1; }
 
-REPO="${INSTALLER_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO="${INSTALLER_REPO:-}"   # config checkout; in Linuxury mode it is cloned when not given
+TEMPLATES="${INSTALLER_TEMPLATES:-$(cd "$(dirname "$0")" && pwd)/templates}"
 ARGS=("$@")
 # Modes: --demo (or --fake-disks) writes nothing · default really installs · --resume continues
 FAKE=""; DEMO=""; RESUME=""
@@ -70,7 +75,9 @@ TITLE=""; CTX=""; NOTE=""; HOST=""; PICK_PREVIEW=""; PREV=""; HEADER=""; BODY=()
 # loop `tput cols` can't see it and silently answers 80)
 TERM_COLS=$(tput cols 2>/dev/null || echo 100); FORMAT_CMDS=()
 HOME_LABEL=home; DATA_LABEL=data; DATA_OLDLABEL=""
-STEP_NAMES=(Host Disks Filesystem Boot Encrypt Swap Secrets Review)
+STEPS=(step_source); STEP_NAMES=(Source)   # the rest is set by set_mode once the source is chosen
+SOURCE=""; SRC_LABEL="guided install"; DIR=fwd
+NIXUSER=""; DESKTOP=none; BROWSER=none; TZONE=UTC; KEYMAP=us; XKB=us; SSH=false; HOSTS=()
 CUR=0
 TTY=/dev/tty; [[ -n ${INSTALL_TEST:-} ]] && TTY=/dev/null
 
@@ -446,7 +453,7 @@ disk_table() {
 }
 
 disk() { jq -r --arg n "$1" ".[] | select(.name==\$n) | $2 // \"\"" <<<"$DISKS"; }
-uid_of() { awk -v u="$1" '$1 == u { gsub(/;/, "", $3); print $3 }' "$REPO/modules/users/uids.nix"; }
+uid_of() { [[ -f $REPO/modules/users/uids.nix ]] || return 0; awk -v u="$1" '$1 == u { gsub(/;/, "", $3); print $3 }' "$REPO/modules/users/uids.nix"; }
 part() { [[ $1 == nvme* || $1 == mmcblk* ]] && echo "/dev/${1}p$2" || echo "/dev/$1$2"; }
 is_foreign() { [[ $(disk "$1" .os) =~ ^(windows|macos|linux)$ ]]; }
 
@@ -669,13 +676,16 @@ answers_json() {
     --arg fs "$FS" --arg sysraid "$SYS_RAID" --arg homefs "$HOME_FS" --arg homelabel "$HOME_LABEL" --arg dlabel "$DATA_LABEL" \
     --arg draid "$DATA_RAID" --arg dfs "$DATA_FS" --arg dkeep "$DATA_KEEP" --arg dmnt "$DATA_MNT" \
     --arg boot "$BOOT" --arg enc "$ENC" --arg swap "$SWAP" \
-    --args '{version: 1, host: $host, user: $user, layout: $layout,
+    --arg source "$SOURCE" --arg tz "$TZONE" --arg keymap "$KEYMAP" --arg xkb "$XKB" \
+    --arg desktop "$DESKTOP" --arg browser "$BROWSER" --arg ssh "$SSH" \
+    --args '{version: 1, source: $source, host: $host, user: $user, layout: $layout,
       disks: {system: $sys, mirrors: ($ARGS.positional[0] | split(" ") | map(select(. != ""))),
               home: $home, data: ($ARGS.positional[1] | split(" ") | map(select(. != ""))),
               other: ($ARGS.positional[2] | split(" ") | map(select(. != "")))},
       fs: $fs, sys_raid: $sysraid, home_fs: $homefs, home_label: $homelabel,
       data: {raid: $draid, fs: $dfs, keep: ($dkeep == "1"), mount: $dmnt, label: $dlabel},
-      boot: $boot, enc: $enc, swap: $swap}' "${mir[*]}" "${dat[*]}" "${ser[*]}"
+      boot: $boot, enc: $enc, swap: $swap,
+      region: {timezone: $tz, keymap: $keymap, xkb: $xkb}, desktop: $desktop, browser: $browser, ssh: ($ssh == "true")}' "${mir[*]}" "${dat[*]}" "${ser[*]}"
 }
 
 # load_answers <file> — sets every choice; returns 1 if a saved disk is missing
@@ -708,14 +718,14 @@ banner() {
   local facts
   facts="${FW^^} · $HW_CPU CPU · $HW_GPU GPU · $(hsize "$RAM_B") RAM · $HW_FORM$([[ $HW_WIFI == 1 ]] && echo " · WiFi" || true) · network $NET · disks ${FAKE:-real}"
   local cols=$TERM_COLS
-  local logo="${tb}NixOS${N}${db}${B}-Config${N}"
+  local logo="${tb}NixOS${N}${db}${B}-Installer${N}"
   if (( cols < 72 )); then
     printf ' %s  %sinstaller · %s%s' "$logo" "$D" "$MODE_TAG" "$N"; return
   fi
   local w=$(( cols - 2 < 120 ? cols - 2 : 120 ))
-  local mid=" ── installer ── Linuxury/nixos-config " tail=" $MODE_TAG ─╮"
-  local fill=$(( w - 3 - 12 - ${#mid} - ${#tail} ))   # 3 = "╭─ ", 12 = "NixOS-Config"
-  if (( fill < 2 )); then mid=" ── installer "; fill=$(( w - 3 - 12 - ${#mid} - ${#tail} )); fi
+  local mid=" ── $SRC_LABEL " tail=" $MODE_TAG ─╮"
+  local fill=$(( w - 3 - 15 - ${#mid} - ${#tail} ))   # 3 = "╭─ ", 15 = "NixOS-Installer"
+  if (( fill < 2 )); then mid=" ── installer "; fill=$(( w - 3 - 15 - ${#mid} - ${#tail} )); fi
   local line; printf -v line '%*s' "$fill" ''; line=${line// /─}
   local bar; printf -v bar '%*s' "$(( w - 2 ))" ''; bar=${bar// /─}
   (( ${#facts} > w - 4 )) && facts="${facts:0:$(( w - 5 ))}…"
@@ -806,7 +816,7 @@ soon() {
 # ==========================================================================
 # Steps — each returns 0 = next, 1 = back, 3 = jump to $JUMP
 # ==========================================================================
-step_host() {
+host_linuxury() {
   panel "Which host are you installing?"
   local opts=() l h u
   for l in "${HOSTS[@]}"; do
@@ -1229,6 +1239,116 @@ step_swap() {
   fi
 }
 
+# --------------------------------------------------------------------------
+# Config source and the starter-template steps
+# --------------------------------------------------------------------------
+set_mode() {
+  if [[ $SOURCE == starter ]]; then
+    SRC_LABEL="starter template"
+    STEPS=(step_source step_host step_disks step_fs step_boot step_enc step_swap step_user step_region step_desktop step_browser step_review)
+    STEP_NAMES=(Source Host Disks Filesystem Boot Encrypt Swap User Region Desktop Browser Review)
+  else
+    SRC_LABEL="Linuxury's config"
+    STEPS=(step_source step_host step_disks step_fs step_boot step_enc step_swap step_secrets step_review)
+    STEP_NAMES=(Source Host Disks Filesystem Boot Encrypt Swap Secrets Review)
+  fi
+  HEADER=$(banner)
+}
+
+# load_config — Linuxury mode: get the config (a given checkout, or a shallow clone) and its hosts
+load_config() {
+  if [[ -n ${INSTALLER_REPO:-} ]]; then REPO=$INSTALLER_REPO
+  else
+    REPO=$TMP/config
+    [[ -d $REPO/.git ]] || git clone -q --depth 1 "$CFG_URL" "$REPO" 2>/dev/null || { warn "could not download $CFG_URL (network?)"; return 1; }
+  fi
+  mapfile -t HOSTS < <(awk '/^ *[A-Za-z0-9-]+ = mkHost/{h=$1} h && /user *=/{gsub(/[";]/,"",$3); print h" "$3; h=""}' "$REPO/flake.nix")
+  (( ${#HOSTS[@]} )) || { warn "no hosts found in $CFG_URL"; return 1; }
+}
+
+step_source() {
+  panel "Where should the system configuration come from?" "$(box -t "Config source" \
+    "Starter template   Nothing of the author's: you get a complete NixOS flake for a first host," \
+    "                   written to your home folder with the first git commit already made." \
+    "Linuxury's config  The author's own setup (desktops, services, secrets) for his machines." \
+    "                   Clones it and adds this machine's disk layout.")"
+  pick SOURCE "" "Starter template ★   a fresh first host; you own the result|starter" \
+                 "Linuxury's config   my own setup, tuned for my machines|linuxury" || return 1
+  [[ -n ${INSTALL_TEST:-} && -n ${TEST_SOURCE:-} ]] && SOURCE=$TEST_SOURCE
+  set_mode
+  if [[ $SOURCE == linuxury ]]; then load_config || { JUMP=$CUR; return 3; }; fi
+}
+
+step_host() { if [[ $SOURCE == starter ]]; then host_starter; else host_linuxury; fi; }
+
+host_starter() {
+  panel "Name this computer" "$(box -t "Detected hardware" "Used to fill in the hardware settings of your starter config:" \
+    "$(printf '%-9s %-26s %-9s %s' CPU "$HW_CPU + microcode" GPU "$HW_GPU")" \
+    "$(printf '%-9s %-26s %-9s %s' Type "$HW_FORM" WiFi "$([[ $HW_WIFI == 1 ]] && echo yes || echo no)")" \
+    "$(printf '%-9s %s' RAM "$(hsize "$RAM_B")")")"
+  while :; do
+    ask HOST --header "Hostname (letters, digits, dashes)" --value "${HOST:-nixos}" || return 1
+    [[ $HOST =~ ^[A-Za-z][A-Za-z0-9-]*$ ]] && break
+    warn "invalid hostname"
+  done
+  NEWHOST=1; PROFILE=$([[ $HW_FORM == laptop ]] && echo laptop || echo desktop)
+}
+
+step_user() {
+  panel "Your account" "$(box -t "Account" \
+    "The first user is an administrator (can use sudo)." \
+    "The password is asked at the end of the install and is not stored in the config." \
+    "More users can be added later in hosts/<host>/default.nix.")"
+  while :; do
+    ask NIXUSER --header "Username (lowercase letters, digits, dashes)" --value "${NIXUSER:-user}" || return 1
+    [[ $NIXUSER =~ ^[a-z][a-z0-9-]{0,30}$ && $NIXUSER != root ]] && break
+    warn "invalid username"
+  done
+  pick SSH "Remote login (SSH)" "No   recommended unless you need it|false" "Yes  log in from another computer|true" || return 1
+}
+
+step_region() {
+  panel "Region" "$(box -t "Timezone and keyboard" \
+    "The timezone sets the clock. The keyboard layout is used at the login screen and in the terminal." \
+    "The locale is en_US.UTF-8; change it later in default.nix.")"
+  pick TZONE "Timezone" "UTC   change later|UTC" "US Eastern   New York|America/New_York" "US Central   Chicago|America/Chicago" \
+    "US Mountain   Denver|America/Denver" "US Pacific   Los Angeles|America/Los_Angeles" "UK   London|Europe/London" \
+    "Spain   Madrid|Europe/Madrid" "Germany   Berlin|Europe/Berlin" "France   Paris|Europe/Paris" "Japan   Tokyo|Asia/Tokyo" \
+    "Other…   type a name, e.g. America/Puerto_Rico|other" || return 1
+  if [[ $TZONE == other ]]; then
+    while :; do
+      ask TZONE --header "Timezone name (see: timedatectl list-timezones)" --value UTC || return 1
+      [[ $TZONE =~ ^[A-Za-z][A-Za-z0-9_+/-]*$ ]] && break
+      warn "invalid timezone name"
+    done
+  fi
+  local kb
+  pick kb "Keyboard layout" "US English|us:us" "UK English|uk:gb" "German|de:de" "French|fr:fr" "Spanish|es:es" \
+    "Latin American|la-latin1:latam" "Portuguese (Brazil)|br-abnt2:br" "Other…   type the names|other" || return 1
+  if [[ $kb == other ]]; then
+    ask KEYMAP --header "Console keymap (e.g. us, de-latin1)" --value us || return 1
+    ask XKB --header "Desktop layout (e.g. us, de)" --value "$KEYMAP" || return 1
+  else KEYMAP=${kb%%:*}; XKB=${kb##*:}; fi
+}
+
+step_desktop() {
+  panel "Desktop" "$(box -t "Desktop stacks" \
+    "None        Text login only. Good for servers, or if you will build your own desktop." \
+    "GNOME       Simple and polished. GDM login, sound, Bluetooth, printing." \
+    "KDE Plasma  Customisable and familiar. SDDM login (Wayland), sound, Bluetooth, printing." \
+    "COSMIC      New Rust desktop by System76. Sound, Bluetooth, printing." \
+    "" "Each stack is a short file in stacks/. Switching later is one line in default.nix.")"
+  pick DESKTOP "" "None ★   text login only|none" "GNOME|gnome" "KDE Plasma 6|kde" "COSMIC|cosmic" || return 1
+  if [[ -n ${INSTALL_TEST:-} && -n ${TEST_DESKTOP:-} ]]; then DESKTOP=$TEST_DESKTOP; fi
+}
+
+step_browser() {
+  if [[ $DESKTOP == none ]]; then BROWSER=none; [[ $DIR == back ]] && return 1; return 0; fi
+  panel "Web browser" "$(box -t "Browser" "Firefox and Chromium are both free software; no extra settings are needed.")"
+  pick BROWSER "" "Firefox ★|firefox" "Chromium|chromium" "None   install one later|none" || return 1
+  if [[ -n ${INSTALL_TEST:-} && -n ${TEST_BROWSER:-} ]]; then BROWSER=$TEST_BROWSER; fi
+}
+
 step_secrets() {
   mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"
   [[ -f $KEYDIR/ssh_host_ed25519_key ]] || ssh-keygen -q -t ed25519 -N "" -C "root@$HOST" -f "$KEYDIR/ssh_host_ed25519_key"
@@ -1357,6 +1477,11 @@ panel_box() {
     "$(gum style --bold --foreground 212 "$t")" "${out[@]}"
 }
 
+review_last() {
+  if [[ $SOURCE == starter ]]; then echo "Config  starter flake, SSH $([[ $SSH == true ]] && echo on || echo off)"
+  else echo "Secrets $([[ $SECRETS == "done" ]] && echo "re-keyed ✓" || echo "skipped")"; fi
+}
+
 review_warnings() {
   local w=() n s
   for n in "$SYS" "${MIRRORS[@]}" "${DATA[@]}" ${HOME_DISK:+"$HOME_DISK"}; do
@@ -1365,7 +1490,7 @@ review_warnings() {
   done
   [[ $FS == zfs || $DATA_FS == zfs ]] && w+=("ZFS holds the kernel to the newest version it supports")
   [[ $HW_FORM == laptop && $ENC == none ]] && w+=("laptop without encryption — data readable if it's stolen")
-  [[ $SECRETS != "done" ]] && w+=("secrets skipped — they fail until re-keyed (docs/06)")
+  [[ $SOURCE != starter && $SECRETS != "done" ]] && w+=("secrets skipped — they fail until re-keyed (docs/06)")
   [[ $FS == btrfs && -n $SYS_RAID ]] && w+=("btrfs mirror: after a disk dies, boot once with -o degraded")
   for n in "${OTHER[@]}"; do is_foreign "${n%%|*}" && w+=("${n%%|*} has another OS ($(disk "${n%%|*}" .os)) — $(other_action "${n#*|}")"); done
   if (( ${#w[@]} == 0 )); then echo "${G}✓ No warnings${N}"; else printf "${Y}⚠ %s${N}\n" "${w[@]}"; fi
@@ -1378,12 +1503,21 @@ step_review() {
   # three panels in one row, together exactly as wide as the header frame
   local cols=$TERM_COLS pw
   pw=$(( ( (cols - 2 < 120 ? cols - 2 : 120) - 2 ) / 3 )); (( pw < 29 )) && pw=29
-  p1=$(panel_box $pw "System" \
-    "Host    $HOST$([[ $NEWHOST == 1 ]] && echo " (new)" || true)" \
-    "User    $NIXUSER ($(uid_of "$NIXUSER"))" \
-    "Desktop $(host_desktop)" \
-    "Kernel  $(host_kernel)" \
-    "Profile $(host_profile)")
+  if [[ $SOURCE == starter ]]; then
+    p1=$(panel_box $pw "System" \
+      "Host    $HOST (new)" \
+      "User    $NIXUSER (administrator)" \
+      "Desktop $DESKTOP" \
+      "Browser $BROWSER" \
+      "Region  $TZONE · $KEYMAP")
+  else
+    p1=$(panel_box $pw "System" \
+      "Host    $HOST$([[ $NEWHOST == 1 ]] && echo " (new)" || true)" \
+      "User    $NIXUSER ($(uid_of "$NIXUSER"))" \
+      "Desktop $(host_desktop)" \
+      "Kernel  $(host_kernel)" \
+      "Profile $(host_profile)")
+  fi
   p2=$(panel_box $pw "Hardware" \
     "CPU     $HW_CPU + microcode" \
     "GPU     $HW_GPU" \
@@ -1395,7 +1529,7 @@ step_review() {
     "Mirror  $( (( ${#MIRRORS[@]} )) && echo "ESP on $(( ${#MIRRORS[@]} + 1 )) disks" || echo "no")" \
     "Encrypt $(enc_label)" \
     "Swap    $([[ $SWAP == 0 ]] && echo "zram" || echo "${SWAP}G swapfile")" \
-    "Secrets $([[ $SECRETS == "done" ]] && echo "re-keyed ✓" || echo "skipped")")
+    "$(review_last)")
   local grid; grid=$(gum join --horizontal "$p1" " " "$p2" " " "$p3")
   panel "Review — $HOST" \
 "$grid
@@ -1595,19 +1729,28 @@ gen_commands() {
   fi
   if [[ $SWAP != 0 && $FS == btrfs ]]; then echo "[[ -e /mnt/swap/swapfile ]] || btrfs filesystem mkswapfile --size ${SWAP}G /mnt/swap/swapfile"; fi
   echo "# [4/7] config"
-  echo "fetch_config   # clone into /mnt/home/$NIXUSER/nixos-config"
-  echo "write_config   # hosts/$HOST/disk.nix + install.json, git commit (+ push if an SSH agent is forwarded)"
-  echo "# [5/7] secrets"
-  echo "install -Dm600 $KEYDIR/ssh_host_ed25519_key /mnt/etc/ssh/ssh_host_ed25519_key"
-  echo "install -Dm644 $KEYDIR/ssh_host_ed25519_key.pub /mnt/etc/ssh/ssh_host_ed25519_key.pub"
-  if [[ $SECRETS == "done" ]]; then echo "git -C /mnt/home/$NIXUSER/nixos-config pull --rebase   # add-host's re-keyed secrets"; fi
+  if [[ $SOURCE == starter ]]; then
+    echo "write_starter   # starter flake in /mnt/home/$NIXUSER/nixos-config, git init + first commit"
+    echo "# [5/7] secrets"
+    echo "# (the starter template uses no secrets)"
+  else
+    echo "fetch_config   # clone into /mnt/home/$NIXUSER/nixos-config"
+    echo "write_config   # hosts/$HOST/disk.nix + install.json, git commit (+ push if an SSH agent is forwarded)"
+    echo "# [5/7] secrets"
+    echo "install -Dm600 $KEYDIR/ssh_host_ed25519_key /mnt/etc/ssh/ssh_host_ed25519_key"
+    echo "install -Dm644 $KEYDIR/ssh_host_ed25519_key.pub /mnt/etc/ssh/ssh_host_ed25519_key.pub"
+    if [[ $SECRETS == "done" ]]; then echo "git -C /mnt/home/$NIXUSER/nixos-config pull --rebase   # add-host's re-keyed secrets"; fi
+  fi
   echo "# [6/7] install"
   echo "grow_live_store   # the ISO's package store lives in RAM — let it spill to swap on the new disk"
   echo "nixos-install --flake /mnt/home/$NIXUSER/nixos-config#$HOST --no-root-passwd"
   echo "nixos-enter --root /mnt -- passwd $NIXUSER"
   echo "# [7/7] finish"
   echo "cp $LOG /mnt/var/log/nixos-install.log"
-  echo "chown -R $(uid_of "$NIXUSER"):100 /mnt/home/$NIXUSER"
+  if [[ $SOURCE == starter ]]; then
+    echo "finish_starter   # commit flake.lock"
+    echo "chown -R 1000:100 /mnt/home/$NIXUSER"   # the first normal user gets uid 1000
+  else echo "chown -R $(uid_of "$NIXUSER"):100 /mnt/home/$NIXUSER"; fi
   echo "swapoff -a; rm -f /mnt/.installer-swap; umount -R /mnt"
 }
 
@@ -1633,6 +1776,80 @@ write_config() {
     git -C "$c" push || echo "push failed — push it after first boot"
   else echo "no forwarded SSH agent — the commit stays local; push it after first boot"; fi
 }
+# ---- starter template ------------------------------------------------------
+nixpkgs_channel() { echo "${INSTALLER_CHANNEL:-nixos-unstable}"; }
+state_version() { local v=${INSTALLER_STATE_VERSION:-$(nixos-version --release 2>/dev/null)}; v=$(sed -nE 's/^([0-9]{2}\.[0-9]{2}).*/\1/p' <<<"$v"); echo "${v:-26.05}"; }   # YY.MM only; the release string can carry a date and codename
+stack_mark() { [[ $DESKTOP == "$1" ]] && echo "" || echo "# "; }   # chosen stack uncommented, the others commented out
+browser_pkg() { [[ $BROWSER == chromium ]] && echo " chromium" || true; }
+browser_program() { [[ $BROWSER == firefox ]] && printf '  programs.firefox.enable = true;\\n' || true; }
+
+# starter_fill FILE — fill the @…@ blanks of a template file
+starter_fill() {
+  sed -e "s|@HOST@|$HOST|g" -e "s|@USER@|$NIXUSER|g" -e "s|@TZ@|$TZONE|g" -e "s|@KEYMAP@|$KEYMAP|g" -e "s|@XKB@|$XKB|g" \
+      -e "s|@SSH@|$SSH|g" -e "s|@CHANNEL@|$(nixpkgs_channel)|g" -e "s|@STATEVERSION@|$(state_version)|g" -e "s|@DATE@|$(date +%F)|g" \
+      -e "s|@GNOME@|$(stack_mark gnome)|" -e "s|@KDE@|$(stack_mark kde)|" -e "s|@COSMIC@|$(stack_mark cosmic)|" \
+      -e "s|@BROWSER_PKG@|$(browser_pkg)|" -e "s|@BROWSER_PROGRAM@|$(browser_program)|" "$1"
+}
+
+# gen_hardware_nix — CPU, GPU, laptop and VM settings from what detect_hw found
+gen_hardware_nix() {
+  cat <<EOF
+# Hardware settings for $HOST found by the installer on $(date +%F): $HW_CPU CPU, $HW_GPU GPU, $HW_FORM.
+{ ... }:
+
+{
+  hardware.enableRedistributableFirmware = true;
+EOF
+  case $HW_CPU in
+    AMD)   echo '  hardware.cpu.amd.updateMicrocode = true;' ;;
+    Intel) echo '  hardware.cpu.intel.updateMicrocode = true;' ;;
+  esac
+  [[ $HW_GPU != none ]] && echo '  hardware.graphics.enable = true;'
+  if [[ $HW_GPU == *NVIDIA* ]]; then
+    cat <<'EOF'
+
+  nixpkgs.config.allowUnfree = true;   # the NVIDIA driver is not free software
+  services.xserver.videoDrivers = [ "nvidia" ];
+  hardware.nvidia = {
+    open = false;   # true works for the RTX 20 series and newer
+    modesetting.enable = true;
+  };
+EOF
+    [[ $HW_GPU == *+* ]] && echo '  # Hybrid graphics also needs hardware.nvidia.prime.* (bus IDs): see the NixOS wiki.'
+  fi
+  [[ $HW_FORM == laptop ]] && echo '  services.power-profiles-daemon.enable = true;'
+  [[ $HW_FORM == "virtual machine" ]] && echo '  services.qemuGuest.enable = true;'
+  echo '}'
+}
+
+# emit_starter DIR — every file of the starter flake except hardware-configuration.nix
+emit_starter() {
+  local c=$1 h=hosts/$HOST f
+  mkdir -p "$c/$h" "$c/stacks"
+  starter_fill "$TEMPLATES/starter/flake.nix" >"$c/flake.nix"
+  starter_fill "$TEMPLATES/starter/host.nix" >"$c/$h/default.nix"
+  starter_fill "$TEMPLATES/starter/README.md" >"$c/README.md"
+  for f in "$TEMPLATES"/starter/stacks/*.nix; do install -Dm644 "$f" "$c/stacks/$(basename "$f")"; done
+  gen_disk_nix >"$c/$h/disk.nix"
+  gen_hardware_nix >"$c/$h/hardware.nix"
+}
+write_starter() {
+  local c=/mnt/home/$NIXUSER/nixos-config
+  emit_starter "$c"
+  nixos-generate-config --root /mnt --no-filesystems --dir "$c/hosts/$HOST" >/dev/null
+  rm -f "$c/hosts/$HOST/configuration.nix"   # we write our own default.nix
+  git -C "$c" init -q -b main
+  git -C "$c" add -A
+  git -C "$c" -c user.name="nixos installer" -c user.email="installer@$HOST" commit -q -m "$HOST: initial configuration from the NixOS installer"
+}
+finish_starter() {
+  local c=/mnt/home/$NIXUSER/nixos-config
+  if [[ -f $c/flake.lock ]]; then
+    git -C "$c" add flake.lock
+    git -C "$c" -c user.name="nixos installer" -c user.email="installer@$HOST" commit -q -m "Add flake.lock" || true
+  fi
+}
+
 # grow_live_store — the live ISO keeps /nix/store in a RAM disk (half of RAM).
 # Evaluating the flake copies the whole repo (wallpapers included) into it, so
 # a small-RAM machine runs out. Swap on the target + a bigger RAM disk fixes it.
@@ -1670,7 +1887,8 @@ run_now() {
 
 save_state() {
   declare -p HOST NIXUSER NEWHOST PROFILE SYS MIRRORS HOME_DISK DATA OTHER FS SYS_RAID HOME_FS HOME_LABEL \
-    DATA_RAID DATA_FS DATA_KEEP DATA_MNT DATA_LABEL DATA_OLDLABEL BOOT ENC SWAP SECRETS FW DISKS NAMES LAYOUT >"$STATE"
+    DATA_RAID DATA_FS DATA_KEEP DATA_MNT DATA_LABEL DATA_OLDLABEL BOOT ENC SWAP SECRETS FW DISKS NAMES LAYOUT \
+    SOURCE DESKTOP BROWSER TZONE KEYMAP XKB SSH >"$STATE"
 }
 
 # preflight — refuse anything that could hurt a running system
@@ -1735,6 +1953,7 @@ checklist() {  # post-install steps for this host, straight from docs/06
 # Main
 # ==========================================================================
 detect_hw
+if [[ -n ${INSTALL_TEST:-} && -n ${TEST_FW:-} ]]; then FW=$TEST_FW; fi   # tests: pretend to boot as uefi or bios
 if [[ -n $FAKE ]]; then ALL=$(fake_disks "$FAKE" | norm)
 else
   ALL=$(real_disks)
@@ -1747,7 +1966,6 @@ fi
 BOOTDEV=$(findmnt -no SOURCE /iso 2>/dev/null | sed -E 's#/dev/##; s/p?[0-9]+$//' || true)
 VISIBLE=$(jq --arg b "$BOOTDEV" '[.[] | select(.name != $b and .tran != "usb" and (.rm|not))]' <<<"$ALL")
 HIDDEN=$(jq -r --arg b "$BOOTDEV" '[.[] | select(.name == $b or .tran == "usb" or .rm) | "\(.name) \(.model)"] | join(", ")' <<<"$ALL")
-mapfile -t HOSTS < <(awk '/^ *[A-Za-z0-9-]+ = mkHost/{h=$1} h && /user *=/{gsub(/[";]/,"",$3); print h" "$3; h=""}' "$REPO/flake.nix")
 SECRETS=skip
 # Saved answers are per disk set — keep fake scenarios apart from real disks
 [[ -n $FAKE ]] && ANSWERS_DIR+="/$FAKE"
@@ -1780,18 +1998,18 @@ if [[ -n $RESUME ]]; then   # skip the menus: same answers, continue the install
   [[ -f $STATE ]] || { echo "nothing to resume ($STATE missing)"; exit 1; }
   # shellcheck disable=SC1090
   source "$STATE"; SYS_DISKS=("$SYS" "${MIRRORS[@]}")
+  [[ $SOURCE == linuxury ]] && { load_config || exit 1; }
   echo "Resuming the install of $HOST after phase $(cat "$PHASEF" 2>/dev/null || echo 0)…"
   if run_install; then echo "${G}${B}✓ $HOST is installed.${N} Remove the USB stick and reboot."; exit 0; fi
   exit 1
 fi
 
-STEPS=(step_host step_disks step_fs step_boot step_enc step_swap step_secrets step_review)
 while (( CUR < ${#STEPS[@]} )); do
   rc=0; "${STEPS[CUR]}" || rc=$?
   case $rc in
-    0) CUR=$((CUR + 1)) ;;
-    3) CUR=$JUMP ;;
-    *) if ((CUR > 0)); then CUR=$((CUR - 1)); fi ;;
+    0) DIR=fwd; CUR=$((CUR + 1)) ;;
+    3) DIR=fwd; CUR=$JUMP ;;
+    *) DIR=back; if ((CUR > 0)); then CUR=$((CUR - 1)); fi ;;
   esac
 done
 if ((ALT)); then tput cnorm; tput rmcup; ALT=0; fi
@@ -1806,24 +2024,47 @@ fi
 if mkdir -p "$ANSWERS_DIR" && answers_json > "$ANSWERS_DIR/$HOST.json" 2>/dev/null; then
   [[ -n ${SUDO_UID:-} ]] && chown -R "$SUDO_UID" "/tmp/install-demo-answers-$OWNER_UID" 2>/dev/null
 else echo "${Y}⚠ could not save answers to $ANSWERS_DIR (continuing)${N}"; fi
-if [[ -n $DEMO ]]; then
-gum style --bold --foreground 212 "hosts/$HOST/disk.nix  (would be written)"
-gen_disk_nix
-echo; gum style --bold --foreground 212 "hosts/$HOST/install.json  (saved answers — would be committed)"
-cat "$ANSWERS_DIR/$HOST.json"
-echo; gum style --bold --foreground 212 "Commands  (would be run — the real installer runs exactly these)"
-gen_commands | gum style --foreground 245
+if [[ $SOURCE == starter ]]; then
+  if [[ -n $DEMO ]]; then
+    OUT=${STARTER_OUT:-$TMP/starter}; emit_starter "$OUT"
+    gum style --bold --foreground 212 "Your starter flake  (would be written to /home/$NIXUSER/nixos-config)"
+    (cd "$OUT" && find . -type f | sed 's|^\./||' | sort) | sed 's/^/  /'
+    echo "  hosts/$HOST/hardware-configuration.nix   (made at install time by nixos-generate-config)"
+    for f in hosts/$HOST/default.nix hosts/$HOST/hardware.nix hosts/$HOST/disk.nix; do
+      echo; gum style --bold --foreground 212 "$f"; cat "$OUT/$f"
+    done
+    echo; gum style --bold --foreground 212 "Commands  (would be run — the real installer runs exactly these)"
+    gen_commands | gum style --foreground 245
+  fi
+  echo; gum style --bold --foreground 212 "After install"
+  printf '  %-9s %s\n' \
+    "Wrote" "/home/$NIXUSER/nixos-config: flake.nix, hosts/$HOST/, stacks/, README.md (first git commit made)" \
+    "Password" "asked for $NIXUSER at the end of the install; it is not stored in the config" \
+    "Log" "/tmp/nixos-install.log → /mnt/var/log/nixos-install.log" \
+    "Resume" "a failed phase continues with: --resume (no re-partitioning)" \
+    "Next" "read /home/$NIXUSER/nixos-config/README.md: rebuild, change desktop, back it up to git"
+  [[ -n $DEMO ]] && { echo; gum style --foreground 82 "✓ Demo complete — nothing was written to disk." \
+    "Real run, from the ISO:  sudo nix run github:Linuxury/NixOS-Installer"; }
+else
+  if [[ -n $DEMO ]]; then
+    gum style --bold --foreground 212 "hosts/$HOST/disk.nix  (would be written)"
+    gen_disk_nix
+    echo; gum style --bold --foreground 212 "hosts/$HOST/install.json  (saved answers — would be committed)"
+    cat "$ANSWERS_DIR/$HOST.json"
+    echo; gum style --bold --foreground 212 "Commands  (would be run — the real installer runs exactly these)"
+    gen_commands | gum style --foreground 245
+  fi
+  echo; gum style --bold --foreground 212 "After install"
+  printf '  %-8s %s\n' \
+    "Wrote" "hosts/$HOST/disk.nix + hosts/$HOST/install.json$([[ $NEWHOST == 1 ]] && echo " + hosts/$HOST/default.nix + flake.nix entry" || true) (git commit)" \
+    "Log" "/tmp/nixos-install.log → /mnt/var/log/nixos-install.log" \
+    "Resume" "a failed phase continues with: --resume (no re-partitioning)" \
+    "Saved" "answers in install.json — next reinstall of $HOST is one keypress" \
+    "Secrets" "$([[ $SECRETS == "done" ]] && echo "re-keyed — they decrypt on first boot" || echo "skipped — run add-host $HOST, then nru (docs/06)")"
+  echo; gum style --bold --foreground 212 "After first boot — checklist for $HOST  (from docs/06-first-boot.md)"
+  checklist
+  [[ -n $DEMO ]] && { echo; gum style --foreground 82 "✓ Demo complete — nothing was written to disk or repo." \
+    "Run the demo again and pick $HOST: it offers ↻ reinstall with these saved answers." \
+    "Real run, from the ISO:  sudo nix run github:Linuxury/NixOS-Installer" \
+    "Or from your admin PC:  install-host <ip>"; }
 fi
-echo; gum style --bold --foreground 212 "After install"
-printf '  %-8s %s\n' \
-  "Wrote" "hosts/$HOST/disk.nix + hosts/$HOST/install.json$([[ $NEWHOST == 1 ]] && echo " + hosts/$HOST/default.nix + flake.nix entry" || true) (git commit)" \
-  "Log" "/tmp/nixos-install.log → /mnt/var/log/nixos-install.log" \
-  "Resume" "a failed phase continues with: install.sh --resume (no re-partitioning)" \
-  "Saved" "answers in install.json — next reinstall of $HOST is one keypress" \
-  "Secrets" "$([[ $SECRETS == "done" ]] && echo "re-keyed — they decrypt on first boot" || echo "skipped — run add-host $HOST, then nru (docs/06)")"
-echo; gum style --bold --foreground 212 "After first boot — checklist for $HOST  (from docs/06-first-boot.md)"
-checklist
-echo; gum style --foreground 82 "✓ Demo complete — nothing was written to disk or repo." \
-  "Run the demo again and pick $HOST: it offers ↻ reinstall with these saved answers." \
-  "Real run, from the ISO:  sudo nix run github:Linuxury/nixos-config#install" \
-  "Or from your admin PC:  install-host <ip>"

@@ -16,10 +16,15 @@
         ];
         # jq programs in single quotes, colours in printf formats, literal \n for Nix: all intended
         excludeShellChecks = [ "SC2016" "SC2028" "SC2059" ];
+        runtimeEnv.INSTALLER_TEMPLATES = "${./templates}";
         text = builtins.readFile ./install.sh;
       };
 
-      demo = pkgs.writeShellScriptBin "install-demo" ''exec ${installer}/bin/nixos-installer --demo "$@"'';
+      demo = pkgs.writeShellApplication {
+        name = "install-demo";
+        text = ''exec ${installer}/bin/nixos-installer --demo "$@"'';
+        meta.description = "Run the installer wizard without writing anything";
+      };
     in
     {
       packages.${system}.default = installer;
