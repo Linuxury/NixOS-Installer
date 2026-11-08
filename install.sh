@@ -1772,7 +1772,8 @@ write_config() {
   git -C "$c" -c user.name="nixos installer" -c user.email="installer@$HOST" \
     commit -q -m "$HOST: disk layout from installer" -- "hosts/$HOST/disk.nix" "hosts/$HOST/install.json" || true
   if [[ -n ${SSH_AUTH_SOCK:-} ]]; then
-    git -C "$c" remote set-url origin git@github.com:Linuxury/nixos-config.git
+    local ssh_url; ssh_url=$(sed -E 's#^https://github\.com/([^/]+/[^/]+)$#git@github.com:\1#; s#(\.git)?$#.git#' <<<"$CFG_URL")
+    [[ $ssh_url == git@github.com:* ]] && git -C "$c" remote set-url origin "$ssh_url"   # push back to the repo that was cloned
     git -C "$c" push || echo "push failed — push it after first boot"
   else echo "no forwarded SSH agent — the commit stays local; push it after first boot"; fi
 }

@@ -17,7 +17,50 @@ The first screen asks where the system configuration comes from.
 | **Starter template** (default) | A complete flake for your first NixOS host, written to `~/nixos-config` with the first git commit made. You own it; none of my own setup is in it. |
 | **Linuxury's config** | My own setup (desktops, services, secrets), made for my machines. The wizard clones it, adds this machine's disk layout and commits that. |
 
-Another repo can be used with `INSTALLER_GIT=<url>`.
+### Using your own config repo
+
+Point the installer at any git repo with `INSTALLER_GIT`, and choose "Linuxury's config" at the first screen (the name is just the option's label):
+
+```sh
+sudo INSTALLER_GIT=https://github.com/you/nixos-config nix run github:Linuxury/NixOS-Installer
+```
+
+The installer clones the repo, adds `hosts/<host>/disk.nix` and `install.json` for the machine, commits them, and runs `nixos-install --flake .#<host>`. If you forwarded an SSH agent (`ssh -A`) it also pushes back to the repo it cloned. For that to work the repo needs:
+
+- a `flake.nix` where each host is written as `<Name> = mkHost { ... user = "<login>"; ... };`, which is how the installer lists your hosts (a different style of flake will show "no hosts found");
+- a folder `hosts/<Name>/` for each host whose `default.nix` imports `./disk.nix` (the installer writes that file and a `hardware-configuration.nix`, so don't commit your own copies).
+
+A minimal example:
+
+```nix
+# flake.nix
+{
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  outputs = { nixpkgs, ... }:
+    let
+      mkHost = { hostname, user }: nixpkgs.lib.nixosSystem {
+        modules = [ ./hosts/${hostname}/default.nix { _module.args.user = user; } ];
+      };
+    in {
+      nixosConfigurations = {
+        Desktop = mkHost {
+          hostname = "Desktop";
+          user     = "you";
+        };
+      };
+    };
+}
+```
+
+```nix
+# hosts/Desktop/default.nix
+{ ... }: {
+  imports = [ ./disk.nix ./hardware-configuration.nix ];
+  networking.hostName = "Desktop";
+  # users, desktop, services ...
+  system.stateVersion = "26.05";
+}
+```
 
 ## Steps (starter template)
 
