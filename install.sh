@@ -735,9 +735,12 @@ banner() {
   printf '%s╰%s╯%s' "$lb" "$bar" "$N"
 }
 
+# host_cfg HOST — the host's main file: <Host>.nix (Linuxury's config), else default.nix
+host_cfg() { local f="$REPO/hosts/$1/$1.nix"; [[ -f $f ]] || f="$REPO/hosts/$1/default.nix"; echo "$f"; }
+
 # Host facts read from its config (default: the chosen $HOST)
 host_desktop() {
-  local f="$REPO/hosts/${1:-$HOST}/default.nix" d
+  local f; f=$(host_cfg "${1:-$HOST}"); local d
   [[ -f $f ]] || { echo "${PROFILE:-?} (new host)"; return; }
   d=$(grep -E '^\s*\.\./\.\./modules/(desktops|compositors|shells)/[a-z0-9-]+' "$f" | sed -E 's#.*modules/[a-z]+/([a-z0-9-]+).*#\1#' | sort -u | paste -sd+)
   echo "${d:-headless}"
@@ -746,12 +749,12 @@ host_profile() {
   local h=${1:-$HOST}
   if [[ -z ${1:-} && $NEWHOST == 1 ]]; then echo "$PROFILE"
   elif [[ $(host_desktop "$h") == headless* ]]; then echo server
-  elif grep -qiE 'services\.tlp|battery|laptop' "$REPO/hosts/$h/default.nix" 2>/dev/null; then echo laptop
+  elif grep -qiE 'services\.tlp|battery|laptop' "$(host_cfg "$h")" 2>/dev/null; then echo laptop
   else echo desktop; fi
 }
 host_kernel() {
   [[ -z ${1:-} && ${FS:-} == zfs ]] && { echo "LTS (ZFS-supported)"; return; }
-  local k; k=$(grep -hoE '^\s*boot.kernelPackages = pkgs\.linuxPackages_[a-z]+' "$REPO/hosts/${1:-$HOST}/default.nix" 2>/dev/null | sed 's/.*_//')
+  local k; k=$(grep -hoE '^\s*boot.kernelPackages = pkgs\.linuxPackages_[a-z]+' "$(host_cfg "${1:-$HOST}")" 2>/dev/null | sed 's/.*_//')
   echo "${k:-zen}"
 }
 
@@ -766,9 +769,9 @@ kv() {
 
 # host_card HOST — what the config says about this host (shown live while picking)
 host_card() {
-  local h=$1 f="$REPO/hosts/$1/default.nix" u gpu fs enc loader saved svc apps dev extras mods
+  local h=$1 f; f=$(host_cfg "$1"); local u gpu fs enc loader saved svc apps dev extras mods
   if [[ $h == NEW ]]; then
-    box -t "New host" "Creates hosts/<name>/default.nix from a template and adds it to flake.nix." "" \
+    box -t "New host" "Creates hosts/<name>/<name>.nix from a template and adds it to flake.nix." "" \
       "Detected on this machine (used to fill in the template):" \
       "$(printf '%-9s %-26s %-9s %s' CPU "$HW_CPU + microcode" GPU "$HW_GPU$([[ $HW_GPU == *+* ]] && echo " (hybrid/PRIME)" || true)")" \
       "$(printf '%-9s %-26s %-9s %s' Type "$HW_FORM" WiFi "$([[ $HW_WIFI == 1 ]] && echo yes || echo no)")" \
@@ -781,7 +784,7 @@ host_card() {
   enc=no; grep -q 'luks.devices' "$f" && enc="LUKS"
   loader=systemd-boot; grep -qE 'boot\.loader\.grub\s*=\s*\{|boot\.loader\.grub\.enable\s*=\s*true' "$f" && loader=GRUB
   # imported modules, minus comments: "services/samba", "development/ai-tools/claude", …
-  mods=$(grep -E '^\s*\.\./\.\./modules/' "$f" | sed -E 's#^\s*\.\./\.\./modules/##; s#/default\.nix##')
+  mods=$(grep -E '^\s*\.\./\.\./modules/' "$f" | sed -E 's#^\s*\.\./\.\./modules/##; s#/default\.nix$##; s#/([a-z0-9-]+)/\1\.nix$#/\1#; s#\.nix$##; s#/(app|service|greeter|shell|theme)-([a-z0-9-]+)$#/\2#')
   list() { sort -u | paste -sd, | sed 's/,/, /g'; }
   svc=$( { grep -oE '^services/[a-z0-9-]+' <<<"$mods" | sed 's#services/##'
            grep -oE '^\s*services\.[a-zA-Z0-9-]+(\s*=\s*\{|\.enable\s*=\s*true)' "$f" | sed -E 's/^\s*services\.//; s/[ .=].*//'
@@ -2057,7 +2060,7 @@ else
   fi
   echo; gum style --bold --foreground 212 "After install"
   printf '  %-8s %s\n' \
-    "Wrote" "hosts/$HOST/disk.nix + hosts/$HOST/install.json$([[ $NEWHOST == 1 ]] && echo " + hosts/$HOST/default.nix + flake.nix entry" || true) (git commit)" \
+    "Wrote" "hosts/$HOST/disk.nix + hosts/$HOST/install.json$([[ $NEWHOST == 1 ]] && echo " + hosts/$HOST/$HOST.nix + flake.nix entry" || true) (git commit)" \
     "Log" "/tmp/nixos-install.log → /mnt/var/log/nixos-install.log" \
     "Resume" "a failed phase continues with: --resume (no re-partitioning)" \
     "Saved" "answers in install.json — next reinstall of $HOST is one keypress" \

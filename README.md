@@ -28,7 +28,7 @@ sudo INSTALLER_GIT=https://github.com/you/nixos-config nix run github:Linuxury/N
 The installer clones the repo, adds `hosts/<host>/disk.nix` and `install.json` for the machine, commits them, and runs `nixos-install --flake .#<host>`. If you forwarded an SSH agent (`ssh -A`) it also pushes back to the repo it cloned. For that to work the repo needs:
 
 - a `flake.nix` where each host is written as `<Name> = mkHost { ... user = "<login>"; ... };`, which is how the installer lists your hosts (a different style of flake will show "no hosts found");
-- a folder `hosts/<Name>/` for each host whose `default.nix` imports `./disk.nix` (the installer writes that file and a `hardware-configuration.nix`, so don't commit your own copies).
+- a folder `hosts/<Name>/` for each host whose main file (`<Name>.nix`, or `default.nix`) imports `./disk.nix` (the installer writes that file and a `hardware-configuration.nix`, so don't commit your own copies).
 
 A minimal example:
 
