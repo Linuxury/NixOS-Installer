@@ -8,6 +8,21 @@ sudo nix run github:Linuxury/NixOS-Installer
 
 It partitions and formats the disks you pick, installs, and writes the configuration. Nothing is touched until you confirm at the Review step and type the hostname.
 
+## Main menu and saved answers
+
+By default the installer asks its questions in order. Two options change that:
+
+```sh
+sudo nix run github:Linuxury/NixOS-Installer -- --hub                 # one main menu, open any entry in any order
+sudo nix run github:Linuxury/NixOS-Installer -- --config answers.json # replay a saved answers file
+```
+
+- **`--hub`** shows every question as one list with its current value on the right, like archinstall. "Install" stays locked until the required entries are set. "Save configuration" writes `answers.json`.
+- **`--config answers.json`** loads a saved file and goes straight to the Review step. You still type the hostname to confirm, so nothing is installed by accident. The disks in the file are matched by serial number.
+- **Additional packages** (starter template, `--hub`): search nixpkgs, see the selected list and what each choice pulls in (download size from the binary cache). Unfree packages are flagged and need "Unfree software" switched on.
+
+Add `--demo` (or `--fake-disks 3-mixed`) to try any of this without touching a disk.
+
 ## Config source
 
 The first screen asks where the system configuration comes from.
@@ -64,11 +79,13 @@ A minimal example:
 
 ## Steps (starter template)
 
-Source, Host, Disks, Filesystem, Boot, Encrypt, Swap, User, Region, Desktop, Browser, Review.
+Source, Host, Disks, Filesystem, Boot, Encrypt, Swap, User, Region, Desktop, Kernel, Unfree software, Review. With `--hub` the same questions are one main menu you can open in any order, plus Additional packages (see below).
 
 - **Disks and filesystem:** btrfs, ext4 or xfs; one disk or a btrfs mirror; optional LUKS; the data disk can be kept or formatted. Mounted disks and the install USB are never offered.
 - **Desktop:** None (default), GNOME, KDE Plasma 6 or COSMIC. Each is a short file in `stacks/`, so switching later is one line in `hosts/<name>/default.nix`.
-- **Browser:** Firefox, Chromium or none.
+- **Kernel:** Default (long-term support), Latest or Zen, each shown with its real Linux version from the nixpkgs channel the new system is locked to (for example Default 6.18, Latest 7.3). One line in the host file, `boot.kernelPackages`. ZFS always uses the default kernel.
+- **Unfree software:** off by default (`nixpkgs.config.allowUnfree`). Switched on automatically when an NVIDIA card is found. Needed for Steam, Discord, Spotify and similar.
+- **Additional packages** (`--hub`): search nixpkgs, see the selected list and what each choice pulls in (size from the binary cache). Browsers are installed this way, for example `firefox` or `chromium`. Unfree packages are flagged.
 
 The generated flake has `flake.nix`, `hosts/<name>/` (with the disk layout, hardware config and host settings), `stacks/` and a README that explains how to rebuild.
 

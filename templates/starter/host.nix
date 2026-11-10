@@ -28,8 +28,14 @@
 
   services.openssh.enable = @SSH@;
 
-  environment.systemPackages = with pkgs; [ git vim@BROWSER_PKG@ ];
-@BROWSER_PROGRAM@
+  # Linux kernel
+@KERNEL@
+
+  # Unfree software (Steam, Discord, Spotify, the NVIDIA driver, ...)
+  nixpkgs.config.allowUnfree = @UNFREE@;
+
+  environment.systemPackages = with pkgs; [ git vim@EXTRA_PKGS@ ];
+
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
   system.stateVersion = "@STATEVERSION@";

@@ -39,12 +39,14 @@ REPO="${INSTALLER_REPO:-}"   # config checkout; in Linuxury mode it is cloned wh
 TEMPLATES="${INSTALLER_TEMPLATES:-$(cd "$(dirname "$0")" && pwd)/templates}"
 ARGS=("$@")
 # Modes: --demo (or --fake-disks) writes nothing · default really installs · --resume continues
-FAKE=""; DEMO=""; RESUME=""
+FAKE=""; DEMO=""; RESUME=""; HUB=0; CONFIG=""; PICK_START=0
 while (($#)); do
   case $1 in
     --demo) DEMO=1 ;;
     --fake-disks) FAKE="${2:?scenario: 2-equal|3-mixed|4-hdd|windows}"; DEMO=1; shift ;;
     --resume) RESUME=1 ;;
+    --hub) HUB=1 ;;   # prototype: archinstall-style main menu instead of a fixed order
+    --config) CONFIG="${2:?answers file}"; HUB=1; shift ;;   # prototype: replay a saved answers file
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -76,9 +78,9 @@ TITLE=""; CTX=""; NOTE=""; HOST=""; PICK_PREVIEW=""; PREV=""; HEADER=""; BODY=()
 TERM_COLS=$(tput cols 2>/dev/null || echo 100); FORMAT_CMDS=()
 HOME_LABEL=home; DATA_LABEL=data; DATA_OLDLABEL=""
 STEPS=(step_source); STEP_NAMES=(Source)   # the rest is set by set_mode once the source is chosen
-SOURCE=""; SRC_LABEL="guided install"; DIR=fwd
-NIXUSER=""; DESKTOP=none; BROWSER=none; TZONE=UTC; KEYMAP=us; XKB=us; SSH=false; HOSTS=()
-CUR=0
+SOURCE=""; SRC_LABEL="guided install"
+NIXUSER=""; DESKTOP=none; KERNEL=default; UNFREE=false; TZONE=UTC; KEYMAP=us; XKB=us; SSH=false; HOSTS=(); PKGS=()
+CUR=0; HUB_IDX=1; REVIEW_IDX=0; declare -A VISITED=() PKGDESC=() PKGUNFREE=() KVER=(); COST_KEY=""; COST_LINE=""; COST_PATHS=()
 TTY=/dev/tty; [[ -n ${INSTALL_TEST:-} ]] && TTY=/dev/null
 
 # card COLOR "title" "status" line… — full-width framed card, same width as the header.
@@ -150,11 +152,16 @@ footer() {  # pinned bottom rows: progress legend · key hints · step chain
   local i chain="" rows; rows=$(tput lines 2>/dev/null || echo 0)
   for i in "${!STEP_NAMES[@]}"; do
     ((i)) && chain+="${D} ─ ${N}"
-    if ((i < CUR)); then chain+="${G}● ${STEP_NAMES[i]}${N}"
-    elif ((i == CUR)); then chain+="${B}${P}◉ ${STEP_NAMES[i]}${N}"
+    local d=0
+    if ((HUB)); then
+      if [[ ${STEPS[i]} == step_source || -n ${VISITED[${STEPS[i]}]:-} ]]; then d=1; fi
+    elif ((i < CUR)); then d=1; fi
+    if ((i == CUR)); then chain+="${B}${P}◉ ${STEP_NAMES[i]}${N}"
+    elif ((d)); then chain+="${G}● ${STEP_NAMES[i]}${N}"
     else chain+="${D}○ ${STEP_NAMES[i]}${N}"; fi
   done
   local legend="${D}step $((CUR + 1))/${#STEP_NAMES[@]} · ${G}●${D} done ${P}◉${D} now ○ next${N}"
+  if ((HUB)); then legend="${D}main menu${N}"; chain=""; fi
   local keys="${D}$1 · esc back · ctrl+c quit${N}"
   if [[ -z ${INSTALL_TEST:-} ]] && ((rows > 12)); then
     printf '\e[?7l'   # no autowrap: a long line on the last row must clip, not scroll the screen
@@ -190,6 +197,7 @@ pick() {
   local LC_ALL=C.UTF-8 labels=() values=() names=() descs=() o i sel=0 top body w=0 last=-1 pad
   local re='^([^ ]+( [^ ]+)*)  +(.*)$'   # "name   description" → two aligned columns
   for o; do labels+=("${o%%|*}"); values+=("${o##*|}"); done
+  sel=${PICK_START:-0}; PICK_START=0; ((sel < ${#values[@]})) || sel=0
   for i in "${!labels[@]}"; do
     if [[ ${labels[i]} =~ $re ]]; then names[i]=${BASH_REMATCH[1]}; descs[i]=${BASH_REMATCH[3]}
     else names[i]=${labels[i]}; descs[i]=""; fi
@@ -677,7 +685,7 @@ answers_json() {
     --arg draid "$DATA_RAID" --arg dfs "$DATA_FS" --arg dkeep "$DATA_KEEP" --arg dmnt "$DATA_MNT" \
     --arg boot "$BOOT" --arg enc "$ENC" --arg swap "$SWAP" \
     --arg source "$SOURCE" --arg tz "$TZONE" --arg keymap "$KEYMAP" --arg xkb "$XKB" \
-    --arg desktop "$DESKTOP" --arg browser "$BROWSER" --arg ssh "$SSH" \
+    --arg desktop "$DESKTOP" --arg kernel "$KERNEL" --arg unfree "$UNFREE" --arg ssh "$SSH" --arg pk "${PKGS[*]:-}" \
     --args '{version: 1, source: $source, host: $host, user: $user, layout: $layout,
       disks: {system: $sys, mirrors: ($ARGS.positional[0] | split(" ") | map(select(. != ""))),
               home: $home, data: ($ARGS.positional[1] | split(" ") | map(select(. != ""))),
@@ -685,7 +693,7 @@ answers_json() {
       fs: $fs, sys_raid: $sysraid, home_fs: $homefs, home_label: $homelabel,
       data: {raid: $draid, fs: $dfs, keep: ($dkeep == "1"), mount: $dmnt, label: $dlabel},
       boot: $boot, enc: $enc, swap: $swap,
-      region: {timezone: $tz, keymap: $keymap, xkb: $xkb}, desktop: $desktop, browser: $browser, ssh: ($ssh == "true")}' "${mir[*]}" "${dat[*]}" "${ser[*]}"
+      region: {timezone: $tz, keymap: $keymap, xkb: $xkb}, desktop: $desktop, kernel: $kernel, unfree: ($unfree == "true"), ssh: ($ssh == "true"), packages: ($pk | split(" ") | map(select(. != "")))}' "${mir[*]}" "${dat[*]}" "${ser[*]}"
 }
 
 # load_answers <file> — sets every choice; returns 1 if a saved disk is missing
@@ -701,6 +709,7 @@ load_answers() {
   DATA_RAID=$(a .data.raid); DATA_FS=$(a .data.fs); DATA_MNT=$(a .data.mount); DATA_LABEL=$(a .data.label); DATA_LABEL=${DATA_LABEL:-data}
   DATA_KEEP=0; [[ $(a .data.keep) == true ]] && DATA_KEEP=1
   BOOT=$(a .boot); ENC=$(a .enc); SWAP=$(a .swap)
+  PKGS=(); for s in $(a '.packages[]?'); do PKGS+=("$s"); done
   DISKS=$ALL; mapfile -t NAMES < <(jq -r '.[].name' <<<"$VISIBLE")
   if ((DATA_KEEP)) && ((${#DATA[@]})); then DATA_OLDLABEL=$(disk "${DATA[0]}" .curlabel); fi
   if (( ${#missing[@]} )); then LOAD_MISSING=$(printf '  ✗ %s\n' "${missing[@]}"); return 1; fi
@@ -857,7 +866,10 @@ host_linuxury() {
     panel "Reinstall $HOST" "$(box -t "Saved answers" "$summary" "All saved disks found (matched by serial number):" \
       "$(printf '  ✓ %s\n' "$SYS" "${MIRRORS[@]}" "${DATA[@]}" ${HOME_DISK:+"$HOME_DISK"})")"
     pick r "" "Reinstall with saved answers ★   → new host key, then review|saved" "Start fresh|fresh" || return 1
-    if [[ $r == saved ]]; then JUMP=6; return 3; fi
+    if [[ $r == saved ]]; then
+      if ((HUB)); then local s; for s in "${STEPS[@]}"; do VISITED[$s]=1; done; JUMP=$HUB_IDX; else JUMP=6; fi
+      return 3
+    fi
   else
     panel "Reinstall $HOST" "$(box -t "Saved answers" "$summary" "Some saved disks are not in this machine anymore:" "$LOAD_MISSING" "" "→ starting fresh")"
     pick r "" "Continue|fresh" || return 1
@@ -1248,13 +1260,25 @@ step_swap() {
 set_mode() {
   if [[ $SOURCE == starter ]]; then
     SRC_LABEL="starter template"
-    STEPS=(step_source step_host step_disks step_fs step_boot step_enc step_swap step_user step_region step_desktop step_browser step_review)
-    STEP_NAMES=(Source Host Disks Filesystem Boot Encrypt Swap User Region Desktop Browser Review)
+    STEPS=(step_source step_host step_disks step_fs step_boot step_enc step_swap step_user step_region step_desktop step_kernel step_unfree step_review)
+    STEP_NAMES=(Source Host Disks Filesystem Boot Encrypt Swap User Region Desktop Kernel Unfree Review)
   else
     SRC_LABEL="Linuxury's config"
     STEPS=(step_source step_host step_disks step_fs step_boot step_enc step_swap step_secrets step_review)
     STEP_NAMES=(Source Host Disks Filesystem Boot Encrypt Swap Secrets Review)
   fi
+  if ((HUB)); then
+    if [[ $SOURCE == starter ]]; then
+      STEPS=(step_source step_hub step_host step_diskconf step_user step_region step_desktop step_kernel step_unfree step_packages step_review)
+      STEP_NAMES=(Source Menu Host Disks User Region Desktop Kernel Unfree Packages Review)
+    else
+      STEPS=(step_source step_hub step_host step_diskconf step_secrets step_review)
+      STEP_NAMES=(Source Menu Host Disks Secrets Review)
+    fi
+    VISITED[step_kernel]=1; VISITED[step_unfree]=1; VISITED[step_packages]=1   # optional: the defaults are valid answers
+  fi
+  if [[ $HW_GPU == *NVIDIA* ]]; then UNFREE=true; fi   # the NVIDIA driver is unfree
+  REVIEW_IDX=$(( ${#STEPS[@]} - 1 ))
   HEADER=$(banner)
 }
 
@@ -1270,6 +1294,13 @@ load_config() {
 }
 
 step_source() {
+  if [[ -n $CONFIG ]]; then   # replay: no questions, straight to the review
+    [[ -f $CONFIG ]] || { warn "answers file not found: $CONFIG"; CONFIG=""; JUMP=$CUR; return 3; }
+    SOURCE=$(jq -r '.source // "starter"' "$CONFIG"); set_mode
+    if [[ $SOURCE == linuxury ]]; then load_config || { CONFIG=""; JUMP=$CUR; return 3; }; fi
+    config_replay "$CONFIG" || { warn "some disks from $CONFIG are not in this machine:"$'\n'"$LOAD_MISSING"; CONFIG=""; JUMP=$CUR; return 3; }
+    JUMP=$REVIEW_IDX; return 3
+  fi
   panel "Where should the system configuration come from?" "$(box -t "Config source" \
     "Starter template   None of my setup: you get a complete NixOS flake for a first host," \
     "                   written to your home folder with the first git commit already made." \
@@ -1345,11 +1376,54 @@ step_desktop() {
   if [[ -n ${INSTALL_TEST:-} && -n ${TEST_DESKTOP:-} ]]; then DESKTOP=$TEST_DESKTOP; fi
 }
 
-step_browser() {
-  if [[ $DESKTOP == none ]]; then BROWSER=none; [[ $DIR == back ]] && return 1; return 0; fi
-  panel "Web browser" "$(box -t "Browser" "Firefox and Chromium are both free software; no extra settings are needed.")"
-  pick BROWSER "" "Firefox ★|firefox" "Chromium|chromium" "None   install one later|none" || return 1
-  if [[ -n ${INSTALL_TEST:-} && -n ${TEST_BROWSER:-} ]]; then BROWSER=$TEST_BROWSER; fi
+kernel_attr() { case $1 in latest) echo linuxPackages_latest ;; zen) echo linuxPackages_zen ;; *) echo linuxPackages ;; esac; }
+# kernel_version KEY — the Linux version that choice has in the nixpkgs the new system will be locked to ("" if offline)
+kernel_version() {
+  local k=$1 v
+  if [[ -z ${KVER[$k]:-} ]]; then
+    v=$(nixc eval --raw "github:NixOS/nixpkgs/$(nixpkgs_channel)#$(kernel_attr "$k").kernel.version" 2>/dev/null) || v=""
+    KVER[$k]=${v:--}
+  fi
+  if [[ ${KVER[$k]} != - ]]; then echo "${KVER[$k]}"; fi
+}
+# kernel_label — short form for the menu and review, e.g. "7.3.3 latest"
+kernel_label() {
+  local k=$KERNEL v z=""
+  if [[ ${FS:-} == zfs ]]; then k=default; z=" (ZFS)"; fi
+  v=$(kernel_version "$k")
+  echo "${v:+$v }$k$z"
+}
+step_kernel() {
+  local vd vl vz
+  printf '  checking the kernel versions …\r' >"$TTY"
+  vd=$(kernel_version default); vl=$(kernel_version latest); vz=$(kernel_version zen)
+  if [[ ${FS:-} == zfs ]]; then
+    panel "Kernel" "$(box -t "Kernel" "ZFS only works with some kernels, so the default kernel ${vd:+(Linux $vd) }is used.")"
+    pick KERNEL "" "OK|default" || return 1
+    return 0
+  fi
+  panel "Kernel" "$(box -t "Linux kernel" \
+    "$(printf '%-8s %-13s %s' Default "${vd:+Linux $vd}" "Long-term support. Most tested.")" \
+    "$(printf '%-8s %-13s %s' Latest "${vl:+Linux $vl}" "Newest stable. New hardware sooner.")" \
+    "$(printf '%-8s %-13s %s' Zen "${vz:+Linux $vz}" "Desktop-tuned (gaming, audio).")" \
+    "" "Versions in nixpkgs ($(nixpkgs_channel)) today. The install uses the same." \
+    "It is one line in your host file, so you can change it later.")"
+  pick KERNEL "" "Default ★   ${vd:+$vd · }long-term support|default" "Latest      ${vl:+$vl · }newest stable|latest" "Zen         ${vz:+$vz · }desktop-tuned|zen" || return 1
+  if [[ -n ${INSTALL_TEST:-} && -n ${TEST_KERNEL:-} ]]; then KERNEL=$TEST_KERNEL; fi
+}
+step_unfree() {
+  if [[ $HW_GPU == *NVIDIA* ]]; then
+    panel "Unfree software" "$(box -t "Unfree software" "Your NVIDIA graphics card needs its proprietary driver, so unfree software is allowed.")"
+    pick UNFREE "" "OK|true" || return 1
+    return 0
+  fi
+  panel "Unfree software" "$(box -t "Unfree software" \
+    "Some programs are free to use but not open source: Steam, Discord, Spotify," \
+    "Google Chrome, VS Code and the NVIDIA driver. NixOS refuses to install them" \
+    "unless you allow it here. Free software only is the default." \
+    "" "It is one line in your host file (nixpkgs.config.allowUnfree).")"
+  pick UNFREE "" "No ★   free software only|false" "Yes   allow unfree programs|true" || return 1
+  if [[ -n ${INSTALL_TEST:-} && -n ${TEST_UNFREE:-} ]]; then UNFREE=$TEST_UNFREE; fi
 }
 
 step_secrets() {
@@ -1499,6 +1573,198 @@ review_warnings() {
   if (( ${#w[@]} == 0 )); then echo "${G}✓ No warnings${N}"; else printf "${Y}⚠ %s${N}\n" "${w[@]}"; fi
 }
 
+# ---- main menu (prototype) --------------------------------------------------
+hub_section() { [[ $1 != step_source && $1 != step_hub && $1 != step_review ]]; }
+hub_label() {
+  case $1 in
+    step_host) echo "Hostname" ;; step_diskconf) echo "Disk configuration" ;; step_user) echo "User account" ;;
+    step_region) echo "Region & keyboard" ;; step_desktop) echo "Desktop" ;; step_kernel) echo "Kernel" ;; step_unfree) echo "Unfree software" ;;
+    step_packages) echo "Additional packages" ;; step_secrets) echo "Secrets" ;;
+  esac
+}
+# hub_value STEP — what that entry currently says
+hub_value() {
+  case $1 in
+    step_host)     echo "${HOST:-}$([[ ${NEWHOST:-0} == 1 ]] && echo " (new)" || true)" ;;
+    step_diskconf) echo "${SYS:-} · ${FS:-} · $(enc_label) · $([[ ${SWAP:-0} == 0 ]] && echo zram || echo "${SWAP}G swap")$( ((${#MIRRORS[@]})) && echo " · +${#MIRRORS[@]} mirror" || true)" ;;
+    step_user)     echo "${NIXUSER:-} · SSH $([[ $SSH == true ]] && echo on || echo off)" ;;
+    step_region)   echo "$TZONE · $KEYMAP" ;;
+    step_desktop)  echo "$DESKTOP" ;;
+    step_kernel)   kernel_label ;;
+    step_unfree)   if [[ $UNFREE == true ]]; then echo "allowed"; else echo "not allowed"; fi ;;
+    step_packages) if ((${#PKGS[@]})); then echo "${PKGS[*]}"; else echo "none"; fi ;;
+    step_secrets)  echo "${SECRETS:-}" ;;
+  esac
+}
+# the disk screens depend on each other, so they run as one entry (like archinstall's "Disk configuration")
+step_diskconf() {
+  local g=(step_disks step_fs step_boot step_enc step_swap) i=0 rc
+  while ((i < ${#g[@]})); do
+    rc=0; "${g[i]}" || rc=$?
+    case $rc in
+      0) i=$((i + 1)) ;;
+      3) ;;   # a sub-screen asked to be shown again
+      *) if ((i == 0)); then return 1; fi; i=$((i - 1)) ;;
+    esac
+  done
+}
+# config_replay FILE — answers file → every setting; returns 1 if a saved disk is missing
+config_replay() {
+  local f=$1 s
+  load_answers "$f" || return 1
+  IFS=$'\t' read -r HOST NIXUSER TZONE KEYMAP XKB DESKTOP KERNEL UNFREE SSH \
+    < <(jq -r '[.host, .user, .region.timezone, .region.keymap, .region.xkb, .desktop, (.kernel // "default"), ((.unfree // false) | tostring), (.ssh | tostring)] | @tsv' "$f")
+  NEWHOST=1
+  for s in "${STEPS[@]}"; do VISITED[$s]=1; done
+}
+
+# nixpkgs search: type a word, pick from the matches (nix search is slow the first time)
+pkg_search() {
+  local q out rows=() choice
+  ask q --header "Search nixpkgs" --placeholder "a program name or a word from its description" || return 0
+  [[ -n $q ]] || return 0
+  out=$(gum spin --title "Searching nixpkgs for \"$q\" …" --show-output -- \
+        nix --extra-experimental-features "nix-command flakes" search nixpkgs "$q" --json 2>/dev/null) || out=""
+  mapfile -t rows < <(jq -r --arg q "$q" 'to_entries | map(.n = (.key | split(".") | .[2:] | join("."))) |
+      sort_by([(.n != $q), (.n | startswith($q) | not), (.n | length)]) | .[:25][] |
+      "\(.n)  \((.value.description // "") | gsub("\\|"; "/") | .[0:78])|\(.n)"' <<<"${out:-{\}}" 2>/dev/null)
+  if ((${#rows[@]} == 0)); then warn "no package matches \"$q\" (or nix search could not reach nixpkgs)"; return 0; fi
+  local r n d
+  for r in "${rows[@]}"; do n=${r##*|}; d=${r%|*}; PKGDESC[$n]=${d#*  }; done
+  pick choice "Matches for \"$q\" — enter adds it, esc cancels" "${rows[@]}" || return 0
+  local x; for x in "${PKGS[@]}"; do [[ $x == "$choice" ]] && return 0; done
+  PKGS+=("$choice")
+}
+nixc() { nix --extra-experimental-features "nix-command flakes" "$@"; }
+# closure_info OUTPATH… — the binary cache's JSON for those paths and everything they depend on (download + unpacked size)
+closure_info() { nixc path-info --store https://cache.nixos.org -r --json "$@" 2>/dev/null; }
+# pkg_unfree PKG — true if nixpkgs marks it unfree (asks the package's metadata, so no unfree opt-in needed)
+pkg_unfree() {
+  local v
+  if [[ -z ${PKGUNFREE[$1]:-} ]]; then
+    v=$(nixc eval --json "nixpkgs#$1.meta.unfree" 2>/dev/null) || v=false
+    if [[ $v == true ]]; then PKGUNFREE[$1]=1; else PKGUNFREE[$1]=0; fi
+  fi
+  [[ ${PKGUNFREE[$1]} == 1 ]]
+}
+# unfree_picked — the selected packages that need allowUnfree
+unfree_picked() { local p; for p in "${PKGS[@]}"; do if pkg_unfree "$p"; then echo "$p"; fi; done; }
+# pkg_cost — what the chosen packages add on top of a bare install (git + vim): sets COST_LINE and COST_PATHS
+pkg_cost() {
+  local key="${PKGS[*]:-}" p op ops=() bad=() uncached=() all res mib; local -A opof=()
+  [[ $key == "$COST_KEY" ]] && return 0
+  COST_KEY=$key; COST_PATHS=(); COST_LINE=""
+  [[ -n $key ]] || return 0
+  printf '  working out what these packages pull in …\r' >"$TTY"
+  for p in "${PKGS[@]}"; do
+    if op=$(NIXPKGS_ALLOW_UNFREE=1 nixc eval --impure --raw "nixpkgs#$p.outPath" 2>/dev/null); then ops+=("$op"); opof[$p]=$op; else bad+=("$p"); fi
+  done
+  if ((${#bad[@]})); then COST_LINE="Cannot size ${bad[*]}: broken or unavailable in nixpkgs."; return 0; fi
+  if [[ -z ${BASE_INFO:-} ]]; then
+    BASE_INFO=$TMP/base.json
+    closure_info "$(nixc eval --raw nixpkgs#git.outPath)" "$(nixc eval --raw nixpkgs#vim.outPath)" >"$BASE_INFO" || true
+  fi
+  if ! all=$(closure_info "${ops[@]}") || [[ ! -s $BASE_INFO ]]; then
+    for p in "${!opof[@]}"; do closure_info "${opof[$p]}" >/dev/null || uncached+=("$p"); done
+    if ((${#uncached[@]})); then COST_LINE="Not in the binary cache: ${uncached[*]}. Fetched from the vendor or built."
+    else COST_LINE="Size unknown: cache.nixos.org could not be reached."; fi
+    return 0
+  fi
+  res=$(jq -r --slurpfile base "$BASE_INFO" '. as $all | ($base[0] | keys) as $bk | (keys - $bk) as $new |
+        "\([$new[] | $all[.].downloadSize] | add // 0)",
+        ($new[] | sub("^/nix/store/[a-z0-9]{32}-"; ""))' <<<"$all")
+  mib=$(( $(head -1 <<<"$res") / 1048576 ))
+  mapfile -t COST_PATHS < <(tail -n +2 <<<"$res" | sort -u)
+  COST_LINE="Together they add ${#COST_PATHS[@]} package$([[ ${#COST_PATHS[@]} == 1 ]] || echo s) and about ${mib} MiB to download."
+}
+# pkg_lines — "name  description", one per chosen package
+pkg_lines() {
+  local p d
+  for p in "${PKGS[@]}"; do
+    d=${PKGDESC[$p]:-}
+    if [[ -z $d ]]; then d=$(nixc eval --raw "nixpkgs#$p.meta.description" 2>/dev/null) || d=""; PKGDESC[$p]=$d; fi
+    if pkg_unfree "$p"; then d="unfree · $d"; fi
+    printf '%-18s %s\n' "$p" "${d:0:58}"
+  done
+}
+step_packages() {
+  [[ -n ${INSTALL_TEST:-} && -n ${TEST_PKGS:-} && ${#PKGS[@]} -eq 0 ]] && read -ra PKGS <<<"$TEST_PKGS"   # tests only
+  [[ -n ${INSTALL_TEST:-} && -z ${TEST_PKGS:-} ]] && return 0
+  local a r o l pl lines unf
+  while :; do
+    pkg_cost
+    mapfile -t pl < <(pkg_lines)
+    mapfile -t unf < <(unfree_picked)
+    lines=("Extra programs, installed for every user on top of the desktop you chose.")
+    if ((${#PKGS[@]})); then
+      lines+=("" "Selected (${#PKGS[@]})")
+      for l in "${pl[@]:0:8}"; do lines+=("  $l"); done
+      if ((${#pl[@]} > 8)); then lines+=("  … and $(( ${#pl[@]} - 8 )) more"); fi
+      lines+=("" "$COST_LINE")
+      if ((${#unf[@]})) && [[ $UNFREE != true ]]; then lines+=("" "⚠ Unfree software is off, but ${unf[*]} needs it.")
+      elif ((${#unf[@]})); then lines+=("" "Unfree, allowed: ${unf[*]}"); fi
+    else lines+=("" "Nothing selected yet.")
+    fi
+    panel "Additional packages" "$(box -t "Packages" "${lines[@]}")"
+    o=("Search nixpkgs…  find a program by name or description|search")
+    if ((${#unf[@]})) && [[ $UNFREE != true ]]; then o+=("Allow unfree software  needed by ${unf[*]}|unfree"); fi
+    if ((${#PKGS[@]})); then
+      if ((${#COST_PATHS[@]})); then o+=("What gets pulled in…  the ${#COST_PATHS[@]} packages these depend on|deps"); fi
+      o+=("Remove a package…  ${#PKGS[@]} selected|remove")
+    fi
+    o+=("Done|done")
+    TEST_IDX=${TEST_PKG_IDX:-0} pick a "" "${o[@]}" || return 1
+    case $a in
+      search) pkg_search ;;
+      unfree) UNFREE=true ;;
+      deps)   if ((${#COST_PATHS[@]})); then
+                o=(); for r in "${COST_PATHS[@]}"; do o+=("$r|$r"); done
+                pick r "Pulled in by ${PKGS[*]} — ${#COST_PATHS[@]} packages (esc closes)" "${o[@]}" || true
+              else warn "nothing to list (size unknown, or no extra dependencies)"; fi ;;
+      remove) o=(); for r in "${PKGS[@]}"; do o+=("$r|$r"); done
+              if pick r "Remove which one?" "${o[@]}"; then
+                local keep=(); for a in "${PKGS[@]}"; do [[ $a == "$r" ]] || keep+=("$a"); done; PKGS=("${keep[@]}")
+              fi ;;
+      done) return 0 ;;
+    esac
+  done
+}
+
+step_hub() {
+  local i fn val opts=() choice next="" nmiss=0 cursor=0
+  for ((i = 2; i < REVIEW_IDX; i++)); do
+    fn=${STEPS[i]}
+    if [[ -n ${VISITED[$fn]:-} ]]; then val=$(hub_value "$fn")
+    else val="(not set)"; nmiss=$((nmiss + 1)); if [[ -z $next ]]; then next=$i; fi; fi
+    opts+=("$(hub_label "$fn")  $val|$i")
+  done
+  opts+=("Save configuration  answers.json for --config|save")
+  if ((nmiss)); then opts+=("Install  ($nmiss missing)|locked"); else opts+=("Install  ready|go"); fi
+  opts+=("Abort|abort")
+  if [[ -n $next ]]; then cursor=$((next - 2)); else cursor=$((REVIEW_IDX - 1)); fi   # first unanswered entry, else Install
+  panel "Main menu" ""
+  if [[ -n ${INSTALL_TEST:-} && -z ${TEST_HUB_SHOW:-} ]]; then
+    choice=${next:-go}
+    if [[ -z $next && -n ${TEST_VISIT:-} ]]; then   # tests only: open one named section once
+      for ((i = 2; i < REVIEW_IDX; i++)); do if [[ ${STEPS[i]} == "$TEST_VISIT" ]]; then choice=$i; fi; done
+      TEST_VISIT=""
+    fi
+  else PICK_START=$cursor; pick choice "" "${opts[@]}" || return 1; fi
+  case $choice in
+    go)     local unf; mapfile -t unf < <(unfree_picked)
+            if ((${#unf[@]})) && [[ $UNFREE != true ]]; then
+              warn "${unf[*]} needs unfree software. Turn on \"Unfree software\" or remove it from the packages."; JUMP=$CUR
+            else JUMP=$REVIEW_IDX; fi ;;
+    locked) warn "Install is locked: ${nmiss} entries still say (not set)."; JUMP=$CUR ;;
+    save)   if ((missing)); then warn "Answer every entry first, then save."
+            else local f=${ANSWERS_OUT:-$PWD/answers.json}; answers_json >"$f"; NOTE+="${G}✓ saved $f — replay with: install --config $f${N}"$'\n'; fi
+            JUMP=$CUR ;;
+    abort)  ((ALT)) && { tput cnorm; tput rmcup; } 2>/dev/null; ALT=0; echo "aborted, nothing was changed"; exit 0 ;;
+    *)      JUMP=$choice ;;
+  esac
+  return 3
+}
+
 step_review() {
   local plan; plan=$(planned)
   local shown; shown=$(jq --argjson keep "$(printf '%s\n' "${NAMES[@]}" | jq -R . | jq -s .)" '[.[] | select(.name as $n | $keep | index($n))]' <<<"$DISKS")
@@ -1511,8 +1777,9 @@ step_review() {
       "Host    $HOST (new)" \
       "User    $NIXUSER (administrator)" \
       "Desktop $DESKTOP" \
-      "Browser $BROWSER" \
-      "Region  $TZONE · $KEYMAP")
+      "Kernel  $(kernel_label)" \
+      "Region  $TZONE · $KEYMAP" \
+      "Extras  ${#PKGS[@]} pkg · unfree $([[ $UNFREE == true ]] && echo yes || echo no)")
   else
     p1=$(panel_box $pw "System" \
       "Host    $HOST$([[ $NEWHOST == 1 ]] && echo " (new)" || true)" \
@@ -1541,6 +1808,7 @@ $(review_warnings)
 ${B}$(review_summary "$plan")${N}
 $(review_cards "$shown" "$plan")"
   local a; pick a "" "Install|go" "Edit a step…|edit" || return 1
+  if [[ $a == edit ]] && ((HUB)); then JUMP=$HUB_IDX; return 3; fi
   if [[ $a == edit ]]; then
     local i o=(); for ((i = 0; i < ${#STEP_NAMES[@]} - 1; i++)); do o+=("${STEP_NAMES[i]}|$i"); done
     pick JUMP "Jump to" "${o[@]}" || return 1; return 3
@@ -1784,15 +2052,21 @@ write_config() {
 nixpkgs_channel() { echo "${INSTALLER_CHANNEL:-nixos-unstable}"; }
 state_version() { local v=${INSTALLER_STATE_VERSION:-$(nixos-version --release 2>/dev/null)}; v=$(sed -nE 's/^([0-9]{2}\.[0-9]{2}).*/\1/p' <<<"$v"); echo "${v:-26.05}"; }   # YY.MM only; the release string can carry a date and codename
 stack_mark() { [[ $DESKTOP == "$1" ]] && echo "" || echo "# "; }   # chosen stack uncommented, the others commented out
-browser_pkg() { [[ $BROWSER == chromium ]] && echo " chromium" || true; }
-browser_program() { [[ $BROWSER == firefox ]] && printf '  programs.firefox.enable = true;\\n' || true; }
+extra_pkgs() { if ((${#PKGS[@]})); then printf ' %s' "${PKGS[@]}"; fi; }
+kernel_line() {
+  local v; v=$(kernel_version "$KERNEL")
+  case $KERNEL in
+    latest|zen) printf '  boot.kernelPackages = pkgs.linuxPackages_%s;%s' "$KERNEL" "${v:+   # Linux $v when this was written}" ;;
+    *) printf '  # boot.kernelPackages = pkgs.linuxPackages_latest;   # the default kernel is used%s; _latest and _zen also exist' "${v:+ (Linux $(kernel_version default))}" ;;
+  esac
+}
 
 # starter_fill FILE — fill the @…@ blanks of a template file
 starter_fill() {
   sed -e "s|@HOST@|$HOST|g" -e "s|@USER@|$NIXUSER|g" -e "s|@TZ@|$TZONE|g" -e "s|@KEYMAP@|$KEYMAP|g" -e "s|@XKB@|$XKB|g" \
       -e "s|@SSH@|$SSH|g" -e "s|@CHANNEL@|$(nixpkgs_channel)|g" -e "s|@STATEVERSION@|$(state_version)|g" -e "s|@DATE@|$(date +%F)|g" \
       -e "s|@GNOME@|$(stack_mark gnome)|" -e "s|@KDE@|$(stack_mark kde)|" -e "s|@COSMIC@|$(stack_mark cosmic)|" \
-      -e "s|@BROWSER_PKG@|$(browser_pkg)|" -e "s|@BROWSER_PROGRAM@|$(browser_program)|" "$1"
+      -e "s|@KERNEL@|$(kernel_line)|" -e "s|@UNFREE@|$UNFREE|" -e "s|@EXTRA_PKGS@|$(extra_pkgs)|" "$1"
 }
 
 # gen_hardware_nix — CPU, GPU, laptop and VM settings from what detect_hw found
@@ -1892,7 +2166,7 @@ run_now() {
 save_state() {
   declare -p HOST NIXUSER NEWHOST PROFILE SYS MIRRORS HOME_DISK DATA OTHER FS SYS_RAID HOME_FS HOME_LABEL \
     DATA_RAID DATA_FS DATA_KEEP DATA_MNT DATA_LABEL DATA_OLDLABEL BOOT ENC SWAP SECRETS FW DISKS NAMES LAYOUT \
-    SOURCE DESKTOP BROWSER TZONE KEYMAP XKB SSH >"$STATE"
+    SOURCE DESKTOP KERNEL UNFREE PKGS TZONE KEYMAP XKB SSH >"$STATE"
 }
 
 # preflight — refuse anything that could hurt a running system
@@ -2009,11 +2283,15 @@ if [[ -n $RESUME ]]; then   # skip the menus: same answers, continue the install
 fi
 
 while (( CUR < ${#STEPS[@]} )); do
-  rc=0; "${STEPS[CUR]}" || rc=$?
+  rc=0; fn=${STEPS[CUR]}; "$fn" || rc=$?
   case $rc in
-    0) DIR=fwd; CUR=$((CUR + 1)) ;;
-    3) DIR=fwd; CUR=$JUMP ;;
-    *) DIR=back; if ((CUR > 0)); then CUR=$((CUR - 1)); fi ;;
+    0) if ((HUB)) && hub_section "$fn"; then   # menu mode: an answered section goes back to the menu
+         VISITED[$fn]=1
+         CUR=$HUB_IDX
+       else CUR=$((CUR + 1)); fi ;;
+    3) CUR=$JUMP ;;
+    *) if ((HUB)) && hub_section "$fn"; then CUR=$HUB_IDX
+       elif ((CUR > 0)); then CUR=$((CUR - 1)); fi ;;
   esac
 done
 if ((ALT)); then tput cnorm; tput rmcup; ALT=0; fi
