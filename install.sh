@@ -954,6 +954,16 @@ answers_json() {
       region: {timezone: $tz, keymap: $keymap, xkb: $xkb}, desktop: $desktop, kernel: $kernel, unfree: ($unfree == "true"), ssh: ($ssh == "true"), packages: ($pk | split(" ") | map(select(. != "")))}' "${mir[*]}" "${dat[*]}" "${ser[*]}"
 }
 
+# saved_answers HOST — print the saved-answers file for HOST, or nothing.
+# Prefers this session's copy in ANSWERS_DIR (/tmp, gone after a reboot), then
+# the committed hosts/HOST/install.json in the config repo. Both use the same
+# format, and disks are matched by serial, so either reinstalls the same way.
+#   Example  f=$(saved_answers "$HOST"); [[ -n $f ]] && load_answers "$f"
+saved_answers() {
+  if [[ -f $ANSWERS_DIR/$1.json ]]; then echo "$ANSWERS_DIR/$1.json"
+  elif [[ -n ${REPO:-} && -f $REPO/hosts/$1/install.json ]]; then echo "$REPO/hosts/$1/install.json"; fi
+}
+
 # load_answers <file> — sets every choice; returns 1 if a saved disk is missing
 # Disks are found by serial. A missing system, mirror, data or home disk is
 # listed in LOAD_MISSING; a missing "other" disk is dropped silently.
@@ -1085,7 +1095,7 @@ host_card() {
               grep -qE 'services\.tlp\s*=|services\.tlp\.enable' "$f" && echo "battery care (tlp)"
               grep -qE 'hardware\.openrgb\.enable\s*=\s*true' "$f" && echo "RGB (openrgb)"
             } | list)
-  saved="none yet"; [[ -f $ANSWERS_DIR/$h.json ]] && saved="↻ yes — 1-key reinstall with the same disks"
+  saved="none yet"; [[ -n $(saved_answers "$h") ]] && saved="↻ yes — 1-key reinstall with the same disks"
   card $'\e[38;5;110m' "$h" "$(host_profile "$h")" \
     "$(printf '%-9s %-26s %-9s %s' User "$u ($(uid_of "$u"))" Desktop "$(host_desktop "$h")")" \
     "$(printf '%-9s %-26s %-9s %s' GPU "${gpu:-?}" Kernel "$(host_kernel "$h")")" \
@@ -1120,7 +1130,7 @@ host_linuxury() {
   local opts=() l h u
   for l in "${HOSTS[@]}"; do
     read -r h u <<<"$l"
-    opts+=("$h$([[ -f $ANSWERS_DIR/$h.json ]] && echo " ↻" || true)|$h")
+    opts+=("$h$([[ -n $(saved_answers "$h") ]] && echo " ↻" || true)|$h")
   done
   PICK_PREVIEW=host_card
   pick HOST "${#HOSTS[@]} hosts in flake.nix" "${opts[@]}" "+ New host$([[ -z $DEMO ]] && echo "  (coming soon)" || true)|NEW" || { PICK_PREVIEW=""; return 1; }
@@ -1145,8 +1155,8 @@ host_linuxury() {
   fi
   for l in "${HOSTS[@]}"; do read -r h u <<<"$l"; if [[ $h == "$HOST" ]]; then NIXUSER=$u; fi; done
 
-  local f=$ANSWERS_DIR/$HOST.json
-  [[ -f $f ]] || return 0
+  local f; f=$(saved_answers "$HOST")
+  [[ -n $f ]] || return 0
   local summary r
   summary=$(jq -r '"saved: \(.fs)\(if .sys_raid != "" then " (" + .sys_raid + ")" else "" end) · \(.boot) · encryption \(.enc) · swap \(.swap)"' "$f")
   if load_answers "$f"; then
@@ -3039,14 +3049,14 @@ if [[ $EUID != 0 && -z $FAKE && -z ${INSTALL_TEST:-} && -n $DEMO ]]; then
   r=skip; pick r "Run as administrator?" "Re-run with sudo ★   (asks for your password)|sudo" "Continue without disk health|skip" || true
   if [[ $r == sudo ]]; then
     ((ALT)) && { tput cnorm; tput rmcup; } 2>/dev/null; ALT=0
-    exec sudo --preserve-env=TERM,COLORTERM,LANG "$0" "${ARGS[@]}"
+    exec sudo --preserve-env=TERM,COLORTERM,LANG,INSTALLER_GIT,INSTALLER_REPO,INSTALLER_CHANNEL,INSTALLER_STATE_VERSION,INSTALLER_TEMPLATES "$0" "${ARGS[@]}"
   fi
 fi
 
 if [[ -z $DEMO && $EUID != 0 ]]; then   # the real installer partitions disks → root
   ((ALT)) && { tput cnorm; tput rmcup; } 2>/dev/null; ALT=0
   echo "The installer partitions disks, so it runs as root."
-  exec sudo --preserve-env=TERM,COLORTERM,LANG,SSH_AUTH_SOCK,INSTALL_ALLOW_NON_ISO,INSTALLER_GIT "$0" "${ARGS[@]}"
+  exec sudo --preserve-env=TERM,COLORTERM,LANG,SSH_AUTH_SOCK,INSTALL_ALLOW_NON_ISO,INSTALLER_GIT,INSTALLER_REPO,INSTALLER_CHANNEL,INSTALLER_STATE_VERSION,INSTALLER_TEMPLATES "$0" "${ARGS[@]}"
 fi
 if [[ -n $RESUME ]]; then   # skip the menus: same answers, continue the install
   ((ALT)) && { tput cnorm; tput rmcup; } 2>/dev/null; ALT=0
