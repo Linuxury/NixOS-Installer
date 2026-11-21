@@ -1915,7 +1915,7 @@ step_secrets() {
       "  add-host $HOST \\" "    '$pub'")
   qr=$(qrencode -t ansiutf8 -m 1 "$pub")
   panel "Secrets (agenix)" "$keybox"$'\n'"${D}or scan the key:${N}"$'\n'"$qr"
-  pick SECRETS "" "I ran add-host — pull the re-keyed secrets|done" "Skip — secrets fail until re-keyed later (docs/06)|skip" || return 1
+  pick SECRETS "" "I ran add-host — pull the re-keyed secrets|done" "Skip — secrets fail until re-keyed later (docs/04)|skip" || return 1
 }
 
 # other_action ROLE — plain words for what happens to a disk that is not
@@ -2089,7 +2089,7 @@ review_warnings() {
   done
   [[ $FS == zfs || $DATA_FS == zfs ]] && w+=("ZFS holds the kernel to the newest version it supports")
   [[ $HW_FORM == laptop && $ENC == none ]] && w+=("laptop without encryption — data readable if it's stolen")
-  [[ $SOURCE != starter && $SECRETS != "done" ]] && w+=("secrets skipped — they fail until re-keyed (docs/06)")
+  [[ $SOURCE != starter && $SECRETS != "done" ]] && w+=("secrets skipped — they fail until re-keyed (docs/04)")
   [[ $FS == btrfs && -n $SYS_RAID ]] && w+=("btrfs mirror: after a disk dies, boot once with -o degraded")
   for n in "${OTHER[@]}"; do is_foreign "${n%%|*}" && w+=("${n%%|*} has another OS ($(disk "${n%%|*}" .os)) — $(other_action "${n#*|}")"); done
   if (( ${#w[@]} == 0 )); then echo "${G}✓ No warnings${N}"; else printf "${Y}⚠ %s${N}\n" "${w[@]}"; fi
@@ -2979,18 +2979,19 @@ install_failed() {
   fi
 }
 
-# checklist — the first-boot to-do list from $REPO/docs/06-first-boot.md:
+# checklist — the first-boot to-do list from $REPO/docs/04-first-boot.md:
 # the "## All Machines" section's ### steps plus the steps under a ## heading
 # that names HOST. Secret steps are ticked when SECRETS=done; the password
 # step notes the primary user is done.
 #   Example  checklist
-checklist() {  # post-install steps for this host, straight from docs/06
+checklist() {  # post-install steps for this host, straight from docs/04
+  [[ -f $REPO/docs/04-first-boot.md ]] || return 0  # older config without the doc: no list
   awk -v host="$HOST" -v sec="$SECRETS" '
     /^## / { s = ($0 ~ /^## All Machines/) ? "all" : ((host != "" && index($0, host)) ? "host" : ""); if (s == "host") print "\n" substr($0, 4); next }
     /^### / && s { t = substr($0, 5)
                    if (sec == "done" && t ~ /secrets\.nix|apply secrets/) print "  ☑ " t "  (done by installer)"
                    else if (t ~ /Set user passwords/) print "  ☐ " t "  (primary user done by installer)"
-                   else print "  ☐ " t }' "$REPO/docs/06-first-boot.md"
+                   else print "  ☐ " t }' "$REPO/docs/04-first-boot.md"
 }
 
 # ==========================================================================
@@ -3125,8 +3126,8 @@ else
     "Log" "/tmp/nixos-install.log → /mnt/var/log/nixos-install.log" \
     "Resume" "a failed phase continues with: --resume (no re-partitioning)" \
     "Saved" "answers in install.json — next reinstall of $HOST is one keypress" \
-    "Secrets" "$([[ $SECRETS == "done" ]] && echo "re-keyed — they decrypt on first boot" || echo "skipped — run add-host $HOST, then nru (docs/06)")"
-  echo; gum style --bold --foreground 212 "After first boot — checklist for $HOST  (from docs/06-first-boot.md)"
+    "Secrets" "$([[ $SECRETS == "done" ]] && echo "re-keyed — they decrypt on first boot" || echo "skipped — run add-host $HOST, then nru (docs/04)")"
+  echo; gum style --bold --foreground 212 "After first boot — checklist for $HOST  (from docs/04-first-boot.md)"
   checklist
   [[ -n $DEMO ]] && { echo; gum style --foreground 82 "✓ Demo complete — nothing was written to disk or repo." \
     "Run the demo again and pick $HOST: it offers ↻ reinstall with these saved answers." \
