@@ -690,9 +690,9 @@ confirm_wipe_foreign() {
 # Labels — the name a file manager shows. Limits are per filesystem.
 # --------------------------------------------------------------------------
 # label_max FS — longest label the installer allows: xfs 12, ext4 16, vfat 11,
-# exfat 15, anything else 32 (btrfs and ntfs allow more; 32 is the cap here).
+# exfat 11, anything else 32 (btrfs and ntfs allow more; 32 is the cap here).
 #   Example  label_max xfs   # → 12
-label_max() { case $1 in xfs) echo 12 ;; ext4) echo 16 ;; vfat) echo 11 ;; exfat) echo 15 ;; *) echo 32 ;; esac; }
+label_max() { case $1 in xfs) echo 12 ;; ext4) echo 16 ;; vfat) echo 11 ;; exfat) echo 11 ;; *) echo 32 ;; esac; }
 # relabel_cmd FS DEV LABEL — print the command that renames a filesystem
 # label in place without touching data: xfs_admin -L, btrfs filesystem
 # label, e2label, fatlabel, ntfslabel or exfatlabel. Other filesystems get a
@@ -1154,7 +1154,12 @@ host_linuxury() {
       "$(printf '  ✓ %s\n' "$SYS" "${MIRRORS[@]}" "${DATA[@]}" ${HOME_DISK:+"$HOME_DISK"})")"
     pick r "" "Reinstall with saved answers ★   → new host key, then review|saved" "Start fresh|fresh" || return 1
     if [[ $r == saved ]]; then
-      if ((HUB)); then local s; for s in "${STEPS[@]}"; do VISITED[$s]=1; done; JUMP=$HUB_IDX; else JUMP=6; fi
+      if ((HUB)); then local s; for s in "${STEPS[@]}"; do VISITED[$s]=1; done; JUMP=$HUB_IDX
+      else
+        # Continue at the Secrets step (new host key), looked up by name.
+        local i; JUMP=$REVIEW_IDX
+        for i in "${!STEPS[@]}"; do if [[ ${STEPS[$i]} == step_secrets ]]; then JUMP=$i; fi; done
+      fi
       return 3
     fi
   else
