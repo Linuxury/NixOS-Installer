@@ -2,6 +2,12 @@
 # ===========================================================================
 # install.sh — guided NixOS installer (with a demo mode)
 #
+# A full-screen wizard (bash + gum) that asks for disks, filesystem, boot
+# loader, encryption, swap and the host, then writes hosts/<host>/disk.nix and
+# runs the install. flake.nix packages it as the nixos-installer command:
+# apps.install (alias apps.default) runs it for real, apps.install-demo runs
+# it with --demo. It can also run directly: bash install.sh --demo.
+#
 # Real mode partitions, formats and installs. It runs as root, only on the
 # live ISO, never wipes a mounted disk, and asks you to type the hostname.
 # Every step is logged to /tmp/nixos-install.log; a failed phase continues
@@ -12,23 +18,46 @@
 #
 # Two config sources (first screen):
 #   Starter template  a fresh first host: the wizard writes a complete flake you own
-#   Linuxury's config my own NixOS setup (clones it, adds the disk layout)
+#   Linuxury's config the Linuxury/nixos-config flake (cloned; the wizard adds
+#                     the disk layout to an existing host)
+#
+# Options:
+#   --demo               write nothing; print disk.nix and the commands instead
+#   --fake-disks NAME    demo with simulated disks (implies --demo):
+#                        2-equal · 3-mixed · 4-hdd · windows
+#   --resume             real mode: re-run the install from the failed phase
+#   --hub                main-menu mode: jump between sections in any order
+#   --config FILE        replay a saved answers file (implies --hub)
+#
+# Environment:
+#   INSTALLER_REPO       existing config checkout to use (else cloned)
+#   INSTALLER_GIT        config repo URL to clone (default:
+#                        https://github.com/Linuxury/nixos-config)
+#   INSTALLER_TEMPLATES  starter template dir (default: templates/ beside this file)
+#   INSTALLER_CHANNEL    nixpkgs branch the starter flake pins (default nixos-unstable)
+#   INSTALLER_STATE_VERSION  system.stateVersion for the starter host
+#   INSTALL_TEST         non-interactive test run: forces demo, takes defaults
+#   TEST_IDX             with INSTALL_TEST: menu option index every pick takes
 #
 # Usage:
 #   sudo nix run github:Linuxury/NixOS-Installer          # on the ISO: install
 #   sudo nix run github:Linuxury/NixOS-Installer -- --resume
 #   nix run .#install-demo                                # demo, your real disks
-#   nix run .#install-demo -- --fake-disks 3-mixed        # demo, fake disks:
-#        2-equal · 3-mixed · 4-hdd · windows
+#   nix run .#install-demo -- --fake-disks 3-mixed        # demo, fake disks
 #
-# v1 real mode: btrfs/ext4/xfs · LUKS · systemd-boot/GRUB/Limine · single disk,
-# btrfs mirror · data disk keep/format · existing hosts. The rest shows
-# "coming soon" outside the demo.
+# Real mode supports: btrfs/ext4/xfs · LUKS · systemd-boot/GRUB/Limine ·
+# single disk, btrfs mirror · data disk keep/format · existing hosts. Other
+# choices (zfs, bcachefs, rEFInd, new host) work only in the demo; real mode
+# shows them as "coming soon" (see soon()).
 #
 # Keys: enter select · esc back one step · ctrl+c quit
 # ===========================================================================
 set -euo pipefail
 
+# Tools: gum (layout), qrencode (QR codes), smartctl (disk health), jq (JSON).
+# When one is missing, re-run this script inside a `nix shell` that provides
+# them; _DEMO_SHELL marks the second run so a failed fetch cannot loop.
+# Then require a real terminal (/dev/tty) unless INSTALL_TEST is set.
 if ! command -v gum >/dev/null || ! command -v qrencode >/dev/null || ! command -v smartctl >/dev/null; then
   [[ -n "${_DEMO_SHELL:-}" ]] && { echo "gum/qrencode/smartctl unavailable" >&2; exit 1; }
   _DEMO_SHELL=1 exec nix shell nixpkgs#gum nixpkgs#qrencode nixpkgs#jq nixpkgs#smartmontools -c bash "$0" "$@"
@@ -38,7 +67,14 @@ fi
 REPO="${INSTALLER_REPO:-}"   # config checkout; in Linuxury mode it is cloned when not given
 TEMPLATES="${INSTALLER_TEMPLATES:-$(cd "$(dirname "$0")" && pwd)/templates}"
 ARGS=("$@")
-# Modes: --demo (or --fake-disks) writes nothing · default really installs · --resume continues
+# Option parsing (each flag is described in the header). ARGS keeps the
+# original arguments for the sudo re-exec in main. Unknown options exit 2.
+#   FAKE        fake-disk scenario name ("" = real disks)
+#   DEMO        1 = write nothing
+#   RESUME      1 = continue a failed install
+#   HUB         1 = main-menu mode
+#   CONFIG      answers file to replay
+#   PICK_START  option index the next pick() starts on (reset after use)
 FAKE=""; DEMO=""; RESUME=""; HUB=0; CONFIG=""; PICK_START=0
 while (($#)); do
   case $1 in
@@ -52,16 +88,28 @@ while (($#)); do
   shift
 done
 [[ -n ${INSTALL_TEST:-} ]] && DEMO=1
+# Files the real install keeps in /tmp on the live ISO:
+#   LOG     full command log
+#   STATE   the answers as shell assignments, sourced again by --resume
+#   PHASEF  number of the last install phase reached (--resume starts there)
+#   KEYDIR  the new host's SSH host key
 LOG=/tmp/nixos-install.log; STATE=/tmp/nixos-install-state.sh; PHASEF=/tmp/nixos-install-phase
 KEYDIR=/tmp/nixos-install-hostkey                     # survives --resume (TMP does not)
-# Saved answers — per user; a sudo run uses (and gives back) the invoking user's folder.
-# Real installer: $REPO/hosts/<host>/install.json
+# Saved answers for the demo: one <host>.json per host in a per-user folder.
+# Under sudo, OWNER_UID is the invoking user (SUDO_UID), so a sudo run reads
+# and writes that user's folder. The real installer saves to
+# $REPO/hosts/<host>/install.json instead.
 OWNER_UID=${SUDO_UID:-$(id -u)}
 ANSWERS_DIR=/tmp/install-demo-answers-$OWNER_UID
+# TMP: scratch dir for this run. ALT=1 once the alternate screen is in use.
+# On exit: show the cursor (tput cnorm), leave the alternate screen
+# (tput rmcup) and delete TMP.
 TMP="$(mktemp -d)"
 ALT=0
 trap '((ALT)) && { tput cnorm; tput rmcup; } 2>/dev/null; rm -rf "$TMP"' EXIT
 
+# ANSI styles: G green, Y yellow, R red, D dim grey, B bold, P pink (accent),
+# N reset.
 G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' D=$'\e[90m' B=$'\e[1m' P=$'\e[38;5;212m' N=$'\e[0m'
 
 # --------------------------------------------------------------------------
@@ -72,6 +120,22 @@ G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' D=$'\e[90m' B=$'\e[1m' P=$'\e[38;5;212m' N=$
 # repainted on every keypress. pick/ask set a variable (no subshell).
 # esc → return 1 (= back), ctrl+c → quit.
 # --------------------------------------------------------------------------
+# Global state, shared by every step:
+#   TITLE CTX NOTE   page title, page body, one-shot warnings (see compose)
+#   HEADER BODY OFF AVAIL  banner text, frozen body lines, scroll offset,
+#                    body rows that fit on screen
+#   PICK_PREVIEW     function pick() calls to draw a preview card ("" = none)
+#   PREV             last preview card drawn
+#   FORMAT_CMDS      commands run by the Disks tools (listed in the demo)
+#   HOME_LABEL DATA_LABEL DATA_OLDLABEL  filesystem labels for /home and data
+#   STEPS STEP_NAMES step functions in order and their status-bar names
+#   SOURCE SRC_LABEL config source and its banner label
+#   NIXUSER DESKTOP KERNEL UNFREE TZONE KEYMAP XKB SSH PKGS  answers with defaults
+#   HOSTS            "host user" lines read from the config
+#   CUR HUB_IDX REVIEW_IDX  current step, index of the hub menu and of Review
+#   VISITED          steps answered at least once (hub mode)
+#   PKGDESC PKGUNFREE KVER COST_*  package and kernel lookup caches
+#   TTY              where keys are read from (/dev/null in tests)
 TITLE=""; CTX=""; NOTE=""; HOST=""; PICK_PREVIEW=""; PREV=""; HEADER=""; BODY=(); OFF=0; AVAIL=10
 # Window width, read only where the terminal is attached (inside $(…) or a piped
 # loop `tput cols` can't see it and silently answers 80)
@@ -85,7 +149,15 @@ TTY=/dev/tty; [[ -n ${INSTALL_TEST:-} ]] && TTY=/dev/null
 
 # card COLOR "title" "status" line… — full-width framed card, same width as the header.
 # Title and status sit in the top border; the frame colour carries the meaning.
-# Arguments may contain newlines; each becomes its own row.
+# Arguments may contain newlines; each becomes its own row. Rows without
+# colour codes that are too wide are cut with "…"; a long title is cut too.
+#   COLOR      ANSI escape for the frame
+#   title      left text in the top border ("" with no status = plain border)
+#   status     right text in the top border ("" = none)
+#   CARD_W     env: card width (default terminal width - 2, max 120)
+#   CARD_HEAVY env: non-empty = thick frame in the accent colour (highlight)
+# Alternative: box() for a neutral grey card.
+#   Example    card $'\e[38;5;110m' "sda" "✓ healthy" "row one" "row two"
 card() {
   local LC_ALL=C.UTF-8 fc=$1 title=$2 st=$3 a l plain fill bar wc cols; shift 3
   local tl='╭' tr='╮' bl='╰' br='╯' hz='─' vt='│'
@@ -107,13 +179,28 @@ card() {
   done
   printf -v bar '%*s' $(( wc - 2 )) ''; printf '%s%s%s%s%s' "$fc" "$bl" "${bar// /$hz}" "$br" "$N"
 }
+# strip_ansi — remove colour codes from stdin (to measure visible width).
+#   Example  plain=$(strip_ansi <<<"$line")
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
-# box [-t TITLE] line… — neutral info card
+# box [-t TITLE] line… — neutral grey card (card() with no status).
+#   -t TITLE  title in the top border
+#   Example   box -t "Filesystems" "ext4  simple" "xfs   big files"
 box() { local t=""; [[ ${1:-} == -t ]] && { t=$2; shift 2; }; card $'\e[38;5;240m' "$t" "" "$@"; }
+# panel TITLE [BODY] — set the page title and body for the next prompt.
+#   Example  panel "Disks" "$table"
 panel() { TITLE=$1; CTX=${2:-}; }
+# warn TEXT… — queue a yellow ⚠ line, shown once under the page body.
+#   Example  warn "invalid hostname"
+# hsize BYTES — human size in SI units with one decimal (numfmt --to=si),
+# e.g. 2000398934016 → 2.1T (numfmt rounds away from zero by default; set
+# --round=nearest to change that). Alternative: --to=iec for powers of 1024.
 warn() { NOTE+="${Y}⚠ $*${N}"$'\n'; }
 hsize() { numfmt --to=si --format=%.1f "$1"; }
 
+# compose — freeze the page body: copy CTX and then NOTE into BODY (one
+# array item per line), clear NOTE so a warning shows only once, and reset
+# the scroll offset. The argument (prompt height) is accepted but unused.
+#   Example  compose 3
 compose() {  # $1 = prompt height · freeze the page body; NOTE is shown once
   BODY=()
   [[ -n $CTX ]] && mapfile -t BODY <<<"$CTX"
@@ -123,6 +210,12 @@ compose() {  # $1 = prompt height · freeze the page body; NOTE is shown once
 
 # render PROMPT HINTS — header, title, a window of the body (PgUp/PgDn scrolls
 # it when the page is taller than the terminal), the prompt, the status bar.
+# Draws from the top-left corner and clears the rest of each line (\e[K) and
+# the screen below (\e[J) instead of clearing the screen, so redraws don't
+# flicker. Under INSTALL_TEST it prints everything plainly instead.
+#   PROMPT  text under the body (menu or input line)
+#   HINTS   key hints for the status bar
+#   Example render "$body" "↑↓ move · enter select"
 render() {
   local prompt=$1 hints=$2 rows n plines win i out
   if [[ -n ${INSTALL_TEST:-} ]]; then
@@ -146,8 +239,17 @@ render() {
   printf '%s' "${out//$'\n'/$'\e[K\n'}"; printf '\e[K\e[J'
   footer "$hints"
 }
+# scroll pgup|pgdn — move the body window by one screen minus 2 lines of
+# overlap; render() clamps the far end.
+#   Example  scroll "$KEY"
 scroll() { case $1 in pgup) OFF=$(( OFF - AVAIL + 2 )) ;; pgdn) OFF=$(( OFF + AVAIL - 2 )) ;; esac; ((OFF < 0)) && OFF=0; return 0; }
 
+# footer HINTS — the status bar on the last three rows: progress legend, key
+# hints, then the step chain (● done, ◉ current, ○ next). In hub mode the
+# legend reads "main menu" and the chain is hidden. Line wrap is turned off
+# (\e[?7l) while drawing. Terminals of 12 rows or fewer, and tests, get the
+# three lines printed in the flow instead.
+#   Example  footer "↑↓ move · enter select"
 footer() {  # pinned bottom rows: progress legend · key hints · step chain
   local i chain="" rows; rows=$(tput lines 2>/dev/null || echo 0)
   for i in "${!STEP_NAMES[@]}"; do
@@ -172,7 +274,15 @@ footer() {  # pinned bottom rows: progress legend · key hints · step chain
   else printf ' %s\n %s\n %s\n' "$legend" "$keys" "$chain"; fi
 }
 
-# key → up|down|enter|back|char:<c>|bs   (arrow keys arrive as ESC [ A)
+# readkey — read one key from $TTY into KEY:
+#   up down pgup pgdn  arrow and page keys (ESC [ A, ESC [ B, ESC [ 5 ~, ESC [ 6 ~)
+#   enter              Return
+#   back               a lone ESC (nothing follows within 0.05 s)
+#   bs                 Backspace (DEL or ^H)
+#   char:<c>           any other key
+#   none               an escape sequence not listed above
+# Exits the script when the terminal is gone, so input never auto-confirms.
+#   Example  readkey; [[ $KEY == enter ]] && break
 readkey() {
   local k rest
   IFS= read -rsn1 k <"$TTY" || exit 1   # terminal gone (e.g. SSH dropped): never auto-confirm
@@ -191,7 +301,21 @@ readkey() {
   esac
 }
 
-# pick VAR "question" "label|value"...
+# pick VAR "question" "label|value"... — arrow-key menu; stores the chosen
+# value in VAR (via printf -v, no subshell). Returns 1 on esc.
+#   VAR          name of the variable to set
+#   question     dim line above the options ("" = none)
+#   label|value  one option: shown label, stored value. A label written as
+#                "name   description" (2+ spaces) becomes two aligned
+#                columns; long descriptions wrap under their column.
+# Shows 12 options at a time; ↑↓ or k/j move, PgUp/PgDn scroll the page.
+#   PICK_START   env: index to start on (reset after use)
+#   PICK_PREVIEW env: function called as "$PICK_PREVIEW VALUE" with CARD_W
+#                set; its card is drawn right of the list for the
+#                highlighted option
+# Under INSTALL_TEST it takes option TEST_IDX, or the one with value "go".
+# Alternatives: yesno() for No/Yes, ask() for free text.
+#   Example  pick FS "Filesystem" "btrfs  snapshots|btrfs" "ext4  simple|ext4" || return 1
 pick() {
   local __v=$1 h=$2; shift 2
   local LC_ALL=C.UTF-8 labels=() values=() names=() descs=() o i sel=0 top body w=0 last=-1 pad
@@ -255,7 +379,15 @@ pick() {
   printf -v "$__v" '%s' "${values[sel]}"
 }
 
-# ask VAR [--header H] [--placeholder P] [--value V]
+# ask VAR [--header H] [--placeholder P] [--value V] [--max N] — one-line
+# text input; stores the text in VAR. Returns 1 on esc.
+#   --header H       dim line above the input
+#   --placeholder P  grey hint shown while empty (tests use it as the answer)
+#   --value V        starting text
+#   --max N          character limit, shown as a counter (0 = none)
+# Backspace deletes the last character; there is no cursor movement.
+# Alternative: pick() when the answer comes from a fixed list.
+#   Example  ask HOST --header "Hostname" --placeholder "e.g. Ryzen7700x" || return 1
 ask() {
   local __v=$1 h="" ph="" val="" max=0; shift
   while (($#)); do case $1 in --header) h=$2 ;; --placeholder) ph=$2 ;; --value) val=$2 ;; --max) max=$2 ;; esac; shift 2; done
@@ -278,12 +410,25 @@ ask() {
   printf -v "$__v" '%s' "$val"
 }
 
-# yesno "question" — No is the default (first)
+# yesno "question" — No/Yes menu; returns 0 for Yes, 1 for No or esc.
+# No is the default (first).
+#   Example  yesno "Format sdb?" || return 1
 yesno() { local a; pick a "$1" "No|n" "Yes|y" || return 1; [[ $a == y ]]; }
 
 # --------------------------------------------------------------------------
 # Hardware detection (sysfs only — works on the bare ISO)
 # --------------------------------------------------------------------------
+# detect_hw — fill the hardware facts shown in the banner and host cards:
+#   FW       uefi when /sys/firmware/efi exists, else bios
+#   RAM_B    total memory in bytes (/proc/meminfo)
+#   NET      ✓ when nixos.org answers one ping within 2 s
+#   HW_CPU   AMD | Intel | other (vendor_id in /proc/cpuinfo)
+#   HW_GPU   vendors of PCI display devices (class 0x03…), joined with "+"
+#            (e.g. Intel+NVIDIA = hybrid), or "none"
+#   HW_FORM  "virtual machine" (systemd-detect-virt), laptop (a battery in
+#            /sys/class/power_supply) or desktop
+#   HW_WIFI  1 when any network interface is wireless
+#   Example  detect_hw; echo "$HW_CPU $HW_GPU"
 detect_hw() {
   [[ -d /sys/firmware/efi ]] && FW=uefi || FW=bios
   RAM_B=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)
@@ -306,6 +451,11 @@ detect_hw() {
 # Disks — real (lsblk + smartctl) or fake; both normalised to:
 # [{name,size,model,serial,tran,rm,rota,segs:[{fs,label,size,uuid}],smart,parts,os,uuid}]
 # --------------------------------------------------------------------------
+# real_disks — JSON list of this machine's disks from lsblk, partitions as
+# segs. lsblk options: -J JSON, -b sizes in bytes, -o the columns to print.
+# zram, loop and optical (sr) devices are skipped. Missing model/transport
+# become "?", a missing serial becomes the device name.
+#   Example  real_disks | norm
 real_disks() {
   lsblk -J -b -o NAME,SIZE,MODEL,SERIAL,TRAN,RM,ROTA,TYPE,FSTYPE,LABEL,UUID | jq '
     [.blockdevices[] | select(.type=="disk" and (.name|test("^(zram|loop|sr)")|not)) |
@@ -314,6 +464,14 @@ real_disks() {
 }
 
 # smart_real DISK → JSON with the raw SMART facts (verdict is derived in norm)
+# smartctl options: -j JSON output, -a all SMART information. Keys:
+#   passed hours temp      overall self-assessment, power-on hours, °C
+#   realloc pending uncorrect  ATA attributes 5, 197, 198 (bad sectors)
+#   media crit wear spare  NVMe media errors, critical warning, % used,
+#                          % spare left
+#   rot                    rotation rate (0 = SSD)
+# Without root, or with no SMART data, it prints {"err": "<reason>"}.
+#   Example  smart_real sda
 smart_real() {
   local j=""
   [[ $EUID == 0 ]] || { echo '{"err":"needs sudo"}'; return; }
@@ -330,6 +488,15 @@ smart_real() {
   echo "$j"
 }
 
+# fake_disks SCENARIO — JSON for a simulated machine (demo only), already in
+# real_disks' shape plus a "smartd" health block; every scenario also has a
+# USB boot stick (sdz):
+#   2-equal  two identical 2 TB NVMe drives (mirror candidates)
+#   3-mixed  NVMe + three SATA disks, one with bad sectors, one holding data
+#   4-hdd    small NVMe + four 4 TB HDDs, one failing (raidz candidates)
+#   windows  a previous NixOS disk, a Windows disk and an xfs games disk
+# Any other name exits 1.
+#   Example  fake_disks 3-mixed | norm
 fake_disks() {
   local stick='{"name":"sdz","size":8004304896,"model":"SanDisk Ultra (boot USB)","serial":"4C530001","tran":"usb","rm":true,"rota":false,"smartd":{"err":"USB stick"},"segs":[{"fs":"iso9660","label":"nixos-minimal","size":1600000000}]}'
   case "$1" in
@@ -363,6 +530,18 @@ EOF
   esac
 }
 
+# norm — normalise a disk list (stdin JSON → stdout JSON). Adds per disk:
+#   segs[].dev  partition device (nvme/mmcblk get a "p": nvme0n1p2)
+#   parts       summary like: vfat, btrfs "nixos"
+#   uuid curlabel datadev  UUID, label and device of the first non-vfat
+#               partition (the one a "keep data" disk mounts)
+#   smart       "level|text" verdict from smartd, level = ok | warn | fail | ?
+#               fail: self-test failed or NVMe critical warning
+#               warn: bad sectors, NVMe media errors, or ≥ 80 % worn
+#               ok:   shows the power-on age and temperature
+#   os          nixos (label nixos or nixos-luks), windows (ntfs), macos
+#               (apfs), linux (ext4/btrfs/xfs next to an EFI vfat), or ""
+#   Example  DISKS=$(real_disks | norm)
 norm() {
   jq 'def age: if . < 720 then "\(.) h" elif . < 8766 then "\(. / 730 | floor) months" else ((. / 876.6 | floor) / 10 | tostring | if contains(".") then . else . + ".0" end) + " yrs" end;
     [.[] | ([.segs[]?.label]) as $l | ([.segs[]?.fs]) as $f | . + {
@@ -389,6 +568,8 @@ norm() {
          else "" end)}]'
 }
 
+# health "level|text" — the smart verdict as a coloured ✓ / ⚠ / ✗ / ? line.
+#   Example  health "$(disk sda .smart)"
 health() {
   case ${1%%|*} in
     ok) echo "${G}✓ ${1#*|}${N}" ;; warn) echo "${Y}⚠ ${1#*|}${N}" ;;
@@ -396,13 +577,23 @@ health() {
   esac
 }
 
-# One partition, fixed 43 columns: dev · label · filesystem · size
+# fmt_seg DEV LABEL FS BYTES — one partition, fixed 43 columns:
+# dev · label · filesystem · size. Long fields are cut; an empty label shows "-".
+# SEG_HEAD is the matching column header; SEG_JQ is the jq filter that turns
+# a disk's segs into DEV␟LABEL␟FS␟SIZE␟PURPOSE lines (␟ = \x1f).
+#   Example  fmt_seg nvme0n1p2 nixos btrfs 999000000000
 fmt_seg() { printf '%-10.10s %-12.12s %-11.11s %7s' "$1" "${2:--}" "$3" "$(hsize "$4")"; }
 SEG_HEAD=$(printf '%-10s %-12s %-11s %7s' PARTITION LABEL FILESYSTEM SIZE)
 SEG_JQ='.segs[] | [.dev, (.label // ""), .fs, (.size|tostring), (.purpose // "")] | join("\u001f")'
 
 # disk_table <json> [after-json] — each disk: header line, then its partitions as a tree.
 # With after-json (Review): NOW → AFTER INSTALL side by side, plus what each partition is for.
+#   json        normalised disk list (see norm)
+#   after-json  planned layout: per disk .action (status text), .same (true =
+#               unchanged) and .segs with .purpose
+# Without after-json each disk is a card() framed by health: red failing,
+# orange worn, blue another OS, grey otherwise.
+#   Example  disk_table "$DISKS"
 disk_table() {
   local before=$1 after=${2:-} n s t m h o note status i d l f z u tree same card_seen=""
   local -a LS RS
@@ -460,12 +651,20 @@ disk_table() {
   done < <(jq -r '.[] | [.name, .size, .tran, .model, .smart, .os] | map(tostring) | join("\u001f")' <<<"$before")
 }
 
+# Small lookups on the current disk list ($DISKS):
+#   disk NAME FIELD   one field, e.g. disk sda .model ("" when null)
+#   uid_of USER       the user's UID from the config's modules/users/uids.nix
+#                     (prints nothing when that file does not exist)
+#   part DISK N       partition N's device path: part nvme0n1 2 → /dev/nvme0n1p2
+#   is_foreign DISK   true when the disk holds Windows, macOS or another Linux
 disk() { jq -r --arg n "$1" ".[] | select(.name==\$n) | $2 // \"\"" <<<"$DISKS"; }
 uid_of() { [[ -f $REPO/modules/users/uids.nix ]] || return 0; awk -v u="$1" '$1 == u { gsub(/;/, "", $3); print $3 }' "$REPO/modules/users/uids.nix"; }
 part() { [[ $1 == nvme* || $1 == mmcblk* ]] && echo "/dev/${1}p$2" || echo "/dev/$1$2"; }
 is_foreign() { [[ $(disk "$1" .os) =~ ^(windows|macos|linux)$ ]]; }
 
-# Refuse failing disks unless confirmed; just warn on worn ones
+# health_ok DISK — refuse failing disks unless confirmed; just warn on worn ones.
+# Returns 1 when a failing disk is not confirmed.
+#   Example  health_ok sdb || return 0
 health_ok() {
   local s; s=$(disk "$1" .smart)
   case ${s%%|*} in
@@ -476,6 +675,9 @@ health_ok() {
   esac
 }
 
+# confirm_wipe_foreign DISK — before wiping a disk with another OS, the user
+# must type the disk's model exactly. Returns 1 on esc or a mismatch.
+#   Example  confirm_wipe_foreign nvme1n1 || return 1
 confirm_wipe_foreign() {
   local model typed keep=$CTX; model=$(disk "$1" .model)
   CTX="$keep"$'\n'"$(box -t "Wipe & reuse $1" "$1 has another OS ($(disk "$1" .os)). To reuse it, type its model exactly:" "$model")"
@@ -487,7 +689,15 @@ confirm_wipe_foreign() {
 # --------------------------------------------------------------------------
 # Labels — the name a file manager shows. Limits are per filesystem.
 # --------------------------------------------------------------------------
+# label_max FS — longest label the installer allows: xfs 12, ext4 16, vfat 11,
+# exfat 15, anything else 32 (btrfs and ntfs allow more; 32 is the cap here).
+#   Example  label_max xfs   # → 12
 label_max() { case $1 in xfs) echo 12 ;; ext4) echo 16 ;; vfat) echo 11 ;; exfat) echo 15 ;; *) echo 32 ;; esac; }
+# relabel_cmd FS DEV LABEL — print the command that renames a filesystem
+# label in place without touching data: xfs_admin -L, btrfs filesystem
+# label, e2label, fatlabel, ntfslabel or exfatlabel. Other filesystems get a
+# "# relabel not supported" comment line.
+#   Example  relabel_cmd ext4 sdb1 games   # → e2label /dev/sdb1 games
 relabel_cmd() {  # fs dev label
   case $1 in
     xfs) echo "xfs_admin -L $3 /dev/$2" ;; btrfs) echo "btrfs filesystem label /dev/$2 $3" ;;
@@ -496,6 +706,11 @@ relabel_cmd() {  # fs dev label
     *) echo "# relabel not supported for $1" ;;
   esac
 }
+# mkfs_cmd FS DEV LABEL — print the command that formats DEV with LABEL.
+# Options: -L / -n label; -f (xfs, btrfs) and -F (ext4) force over an
+# existing filesystem; mkfs.fat -F32 picks FAT32; mkfs.ntfs -f is a quick
+# format (no zeroing).
+#   Example  mkfs_cmd xfs sdb1 games   # → mkfs.xfs -f -L games /dev/sdb1
 mkfs_cmd() {  # fs dev label
   case $1 in
     vfat) echo "mkfs.fat -F32 -n $3 /dev/$2" ;; ntfs) echo "mkfs.ntfs -f -L $3 /dev/$2" ;;
@@ -504,6 +719,9 @@ mkfs_cmd() {  # fs dev label
 }
 
 # ask_label VAR fs default — validated, vfat forced to UPPERCASE
+# Asks until the label uses only letters, digits, . _ - and fits label_max.
+# For zfs the prompt reads "Pool name". Returns 1 on esc.
+#   Example  ask_label lbl ext4 data || return 1
 ask_label() {
   local __lv=$1 fs=$2 def=$3 max __lbl what="Label (name shown in the file manager)"
   [[ $fs == zfs ]] && what="Pool name"
@@ -519,6 +737,12 @@ ask_label() {
 
 # Disk tool: format any disk right now, then return to the Disks screen.
 # Real installer runs the commands immediately; the demo only updates its view.
+# Steps: pick a disk, a filesystem and a label, confirm (or type the model
+# for another OS's disk), then wipefs -a + one GPT partition over the whole
+# disk (parted -s mklabel gpt mkpart data 1MiB 100%) + mkfs. A disk with
+# mounted partitions is refused. ALL, VISIBLE and DISKS are updated to the
+# new layout. Returns 1 on esc or refusal.
+#   Example  format_tool || true
 format_tool() {
   local n fs lbl dopts=() keep=$CTX
   TITLE="Disks · format a disk"
@@ -552,6 +776,9 @@ format_tool() {
 }
 
 # Disk tool: SMART health per disk, every value explained
+# One card per disk: self-test, power-on time, temperature (SSD and HDD
+# limits differ), bad sectors, and for NVMe wear, media errors and spare.
+#   Example  health_view || true
 health_view() {
   local n out="" fc st d v
   out=$(box -t "What is SMART?" \
@@ -589,6 +816,10 @@ health_view() {
 }
 
 # Disk tool: rename a partition's label in place (no data touched).
+# Offers partitions with ext4, xfs, btrfs, vfat, ntfs or exfat. The system
+# labels nixos, nixos-luks* and EFI* are refused, because host configs find
+# the system disk by them. Asks to confirm on another OS's disk.
+#   Example  rename_tool || true
 rename_tool() {
   local n i d fs cur lbl dopts=() popts=() PARTS=()
   TITLE="Disks · rename a label"
@@ -620,6 +851,21 @@ rename_tool() {
 # --------------------------------------------------------------------------
 # RAID suggestions — sizes on stdin → "id|usable|survives|note|star" / "-|id|reason"
 # --------------------------------------------------------------------------
+# raid_options system|data — one line per layout, read by choose_raid:
+#   id|usable bytes|disks that may die|note|1 = recommended (★)
+#   -|id|reason           a layout these disks cannot do
+# Layouts and usable space (sum = all sizes, min/max = smallest/largest disk):
+#   btrfs-raid1    2 copies     min(sum/2, sum-max)
+#   btrfs-raid1c3  3 copies     min(sum/3, sum-max-max2)          (≥ 3 disks)
+#   btrfs-raid10   striped 2 copies, min(sum/2, sum-max)          (≥ 4 disks)
+#   zfs-mirror     n-way mirror min                               (any count)
+#   zfs-raidz1/2/3 parity       (n-1/2/3) × min      (data only, ≥ 3/4/5 disks)
+# Disks within 5 % of each other count as equal sizes. zfs counts every disk
+# as the smallest one, so mixed sizes add a "wasted" note. The ★ goes to:
+# 2 disks zfs-mirror, 3 zfs-raidz1, 4+ zfs-raidz2 when sizes are equal, else
+# btrfs-raid1 (btrfs-raid10 for 4+); for the system scope raidz becomes
+# zfs-mirror.
+#   Example  printf '%s\n' 2000398934016 2000398934016 | raid_options data
 raid_options() {
   awk -v scope="$1" '
     { s[NR]=$1; sum+=$1; if (NR==1 || $1<min) min=$1
@@ -644,6 +890,10 @@ raid_options() {
 }
 
 # choose_raid <system|data> disk… → RAID_CHOICE
+# Shows the layouts from raid_options with usable size and how many disks may
+# die, plus warnings: SSD + HDD mixed, worn disks, USB disks, and disks with
+# data that will be wiped. Returns 1 on esc.
+#   Example  choose_raid data sda sdb sdc || return 1
 choose_raid() {
   local scope=$1; shift
   local sizes rows labels=() blocked="" warns="" d s
@@ -671,9 +921,17 @@ choose_raid() {
 # Saved answers — choices stored per host, disks matched by SERIAL
 # (device names like sda/nvme0n1 can swap between boots)
 # --------------------------------------------------------------------------
+# serial_of DISK → its serial; name_of SERIAL → its current device name in
+# $ALL (empty when that disk is not in this machine).
 serial_of() { disk "$1" .serial; }
 name_of() { jq -r --arg s "$1" '.[] | select(.serial==$s) | .name' <<<"$ALL"; }
 
+# answers_json — print every current answer as JSON (format version 1):
+# host, user, layout, disks (by serial: system, mirrors, home, data, other
+# with "serial|role"), fs, RAID, labels, data pool options, boot, enc, swap,
+# region, desktop, kernel, unfree, ssh and extra packages. load_answers
+# reads it back.
+#   Example  answers_json >"$ANSWERS_DIR/$HOST.json"
 answers_json() {
   local o ser=() m mir=() dat=() d
   for m in "${MIRRORS[@]}"; do mir+=("$(serial_of "$m")"); done
@@ -697,6 +955,9 @@ answers_json() {
 }
 
 # load_answers <file> — sets every choice; returns 1 if a saved disk is missing
+# Disks are found by serial. A missing system, mirror, data or home disk is
+# listed in LOAD_MISSING; a missing "other" disk is dropped silently.
+#   Example  load_answers "$ANSWERS_DIR/$HOST.json" || echo "$LOAD_MISSING"
 load_answers() {
   local f=$1 s n missing=()
   a() { jq -r "$1 // \"\"" "$f"; }
@@ -717,9 +978,13 @@ load_answers() {
 
 # --------------------------------------------------------------------------
 # Banner — framed 3-line header in the two NixOS logo blues
-# (#7EBAE4 light "NixOS", #5277C3 dark "-Config"). Width follows the
-# terminal (72–120 cols); narrower terminals get a one-line version.
+# (light "NixOS", dark "-Installer", as 256-colour approximations). Width
+# follows the terminal (72–120 cols); narrower terminals get a one-line version.
+# Line 1: logo, config source and MODE_TAG (orange in the demo, red for a
+# real install). Line 2: firmware, CPU, GPU, RAM, form factor, WiFi, network
+# and disk source.
 # C.UTF-8 is built into glibc, so ${#s} counts characters even on the ISO.
+#   Example  HEADER=$(banner)
 # --------------------------------------------------------------------------
 banner() {
   local LC_ALL=C.UTF-8
@@ -748,6 +1013,12 @@ banner() {
 host_cfg() { local f="$REPO/hosts/$1/$1.nix"; [[ -f $f ]] || f="$REPO/hosts/$1/default.nix"; echo "$f"; }
 
 # Host facts read from its config (default: the chosen $HOST)
+#   host_desktop [HOST]  desktop/compositor/shell modules the host imports,
+#                        joined with "+", or "headless"
+#   host_profile [HOST]  server (headless), laptop (tlp, battery or laptop
+#                        in its config) or desktop; a new host uses PROFILE
+#   host_kernel [HOST]   kernel flavour from boot.kernelPackages (default
+#                        zen); for the chosen host with zfs: the LTS kernel
 host_desktop() {
   local f; f=$(host_cfg "${1:-$HOST}"); local d
   [[ -f $f ]] || { echo "${PROFILE:-?} (new host)"; return; }
@@ -768,6 +1039,8 @@ host_kernel() {
 }
 
 # kv KEY "a, b, c" — one card row; long lists wrap onto aligned continuation rows
+# An empty list shows "—". Width follows CARD_W like card().
+#   Example  kv Services "samba, jellyfin"
 kv() {
   local width=$(( ${CARD_W:-$(( TERM_COLS - 2 < 120 ? TERM_COLS - 2 : 120 ))} - 4 - 10 ))
   local first=1 l
@@ -777,6 +1050,11 @@ kv() {
 }
 
 # host_card HOST — what the config says about this host (shown live while picking)
+# Used as pick()'s PICK_PREVIEW. Reads the host file with grep: user + UID,
+# desktop, GPU, kernel, filesystem + LUKS, boot loader, services, apps,
+# development tools, extras (gaming, fingerprint, tlp, openrgb) and whether
+# saved answers exist. HOST=NEW shows the detected hardware instead.
+#   Example  host_card Ryzen5900x
 host_card() {
   local h=$1 f; f=$(host_cfg "$1"); local u gpu fs enc loader saved svc apps dev extras mods
   if [[ $h == NEW ]]; then
@@ -816,7 +1094,10 @@ host_card() {
     "$(printf '%-9s %s' Saved "$saved")"
 }
 
-# soon VALUE — true (and warns) when real mode doesn't support VALUE yet
+# soon VALUE — true (and warns) when real mode doesn't support VALUE
+# Demo-only values: zfs, zfs-*, bcachefs, refind, NEW (new host). Always
+# false in the demo.
+#   Example  if soon "$FS"; then JUMP=$CUR; return 3; fi
 soon() {
   [[ -n $DEMO ]] && return 1
   case $1 in
@@ -828,6 +1109,12 @@ soon() {
 # ==========================================================================
 # Steps — each returns 0 = next, 1 = back, 3 = jump to $JUMP
 # ==========================================================================
+# host_linuxury — Host step for the Linuxury config: pick a host from its
+# flake.nix (↻ = saved answers exist), with host_card as preview. "+ New
+# host" asks for a hostname, primary user and profile (laptop, desktop,
+# server; ★ follows the detected form factor). An existing host with saved
+# answers offers a reinstall that loads them and jumps ahead (hub: back to
+# the menu; otherwise step index 6).
 host_linuxury() {
   panel "Which host are you installing?"
   local opts=() l h u
@@ -876,6 +1163,11 @@ host_linuxury() {
   fi
 }
 
+# step_disks — Disks step: the disk cards, then a menu: Single disk, Multi-disk
+# (more than one disk), the Format / Rename / Disk health tools, and "Show
+# removable disks too" when some are hidden. Tools and "show" come back to
+# this screen (return 3 with JUMP=$CUR); both layouts continue to
+# roles_screen.
 step_disks() {
   MIRRORS=(); HOME_DISK=""; DATA=(); OTHER=(); LAYOUT=single
   DISKS=$VISIBLE
@@ -904,7 +1196,11 @@ step_disks() {
 # Disk roles — the disk cards ARE the selection. ↑↓ highlights a card,
 # enter opens its role menu under the cards; the corner shows the role.
 # --------------------------------------------------------------------------
+# ROLE[disk]: system | mirror | home | data | untouched | another-OS action
+# (boot, mount-ro, mount-rw, boot+mount-ro) | "" (not chosen yet).
 declare -A ROLE=()
+# role_status ROLE — frame colour and corner text for a disk card: red for
+# roles that wipe the disk, green data, blue other-OS actions, grey otherwise.
 role_status() {  # role → "colour|corner text"
   case $1 in
     system)   echo $'\e[38;5;203m'"|● System ★ (wiped)" ;;
@@ -916,6 +1212,9 @@ role_status() {  # role → "colour|corner text"
     *)        echo $'\e[38;5;242m'"|○ choose a role" ;;
   esac
 }
+# role_card DISK HIGHLIGHT — a disk's card with its role in the corner, model,
+# other OS, health problems and partitions. HIGHLIGHT 1 draws it heavy.
+#   Example  role_card sda 1
 role_card() {  # role_card DISK HIGHLIGHT(0|1)
   local n=$1 fc st h o title i d l f z u tree; local -a LS rows=()
   IFS='|' read -r fc st <<<"$(role_status "${ROLE[$n]:-}")"
@@ -932,6 +1231,7 @@ role_card() {  # role_card DISK HIGHLIGHT(0|1)
   done
   if (( $2 )); then CARD_HEAVY=1 card "$fc" "$title" "$st" "${rows[@]}"; else card "$fc" "$title" "$st" "${rows[@]}"; fi
 }
+# role_plan — one line summing up the roles: "Plan: System sda · Data sdb · …"
 role_plan() {
   local n parts=()
   for n in "${NAMES[@]}"; do
@@ -947,6 +1247,10 @@ role_plan() {
 # --------------------------------------------------------------------------
 # Role guide — speed, pros/cons and a recommendation for the disk being set
 # --------------------------------------------------------------------------
+# disk_kind DISK — nvme (transport nvme), usb (transport usb), hdd
+# (rotational) or ssd. kind_speed KIND — one line of typical speed.
+# kind_rank KIND — 3 nvme, 2 ssd, 1 hdd, 0 usb (higher = faster).
+#   Example  kind_speed "$(disk_kind sda)"
 disk_kind() {  # nvme | ssd | hdd | usb
   local t; t=$(disk "$1" .tran)
   if [[ $t == usb ]]; then echo usb; elif [[ $t == nvme ]]; then echo nvme
@@ -972,6 +1276,12 @@ best_system() {
   echo "$best"
 }
 # rec_role DISK → "role|reason"
+# First match wins: failing or worn → untouched; another OS (not yet
+# cleared for wiping) → untouched; no System disk yet and this is
+# best_system → system; multi-disk with the same kind and size within ±10 %
+# of the System disk → mirror; single-disk layout → untouched; HDD → data;
+# USB → untouched; any other SSD → data.
+#   Example  IFS='|' read -r rec why <<<"$(rec_role sdb)"
 rec_role() {
   local n=$1 k h ks sz ss; k=$(disk_kind "$n"); h=$(disk "$n" .smart)
   [[ ${h%%|*} == fail ]] && { echo "untouched|it is failing — keep data off it and replace it"; return; }
@@ -995,6 +1305,11 @@ rec_role() {
 }
 
 # role_info ROLE — the guide card shown beside the role list (ROLE_DISK = disk)
+# Used as pick()'s PICK_PREVIEW in set_role: what the role does, + pros and
+# − cons, speed or fit for this disk, its health, and ★ when it matches
+# rec_role. ROLE is any value set_role offers (system, mirror, home, data,
+# untouched, boot, mount-ro, mount-rw, boot+mount-ro, wipe).
+#   Example  ROLE_DISK=sda CARD_W=60 role_info system
 role_info() {
   local r=$1 n=$ROLE_DISK k rec why w l out=()
   k=$(disk_kind "$n"); IFS='|' read -r rec why <<<"$(rec_role "$n")"
@@ -1069,6 +1384,13 @@ role_info() {
 }
 
 # set_role DISK — role window: the disk's card on top, role list left, guide right
+# A disk with another OS first offers: untouched, boot menu entry, mount
+# read-only / read-write, boot entry + mount, or wipe & reuse (typed model
+# confirms; WIPEOK then unlocks the normal roles). Normal roles: System, and
+# for multi-disk Mirror of the System disk, /home and Data pool; Untouched.
+# Only one System and one /home disk: choosing it again moves the role.
+# Losing the System disk clears every Mirror. esc keeps the old role.
+#   Example  set_role sdb
 set_role() {
   local n=$1 r opts=() m rec why star
   ROLE_DISK=$n; IFS='|' read -r rec why <<<"$(rec_role "$n")"
@@ -1104,6 +1426,14 @@ set_role() {
   return 0
 }
 
+# roles_screen — the Disks · assign roles page: every disk as a card, ↑↓
+# highlights one, enter opens set_role, "Continue →" below the cards needs a
+# System disk. The page scrolls to keep the highlighted card visible. Single
+# layout starts every disk as untouched. Under INSTALL_TEST the first disk is
+# System and, for multi, the next disk without another OS is Data.
+# On continue it sets SYS, MIRRORS, HOME_DISK, DATA and OTHER ("disk|role").
+# Returns 1 on esc.
+#   Example  roles_screen || { JUMP=$CUR; return 3; }
 roles_screen() {
   local idx=0 n i cards start=() ends=() line=0 c prompt
   declare -gA WIPEOK=(); ROLE=(); SYS=""
@@ -1156,6 +1486,7 @@ roles_screen() {
   done
 }
 
+# FS_INFO — the filesystem guide box step_fs shows above the choice.
 FS_INFO=(
   "btrfs     Snapshots (snapper, hourly), compression, subvolumes. Roll back a bad update."
   "          ★ Recommended for desktops/laptops — what every host uses today."
@@ -1165,6 +1496,22 @@ FS_INFO=(
   "zfs       Best data integrity, pools/raidz, native encryption. Built for servers/NAS."
   "          ⚠ Out-of-tree module: kernel is held to the newest version ZFS supports"
   "            (your hosts run _latest/_zen). Uses a lot of RAM for its cache.")
+
+# step_fs — choose the filesystem for every disk role picked in step_disks.
+#   System disk  with mirrors: choose_raid picks a RAID layout and FS is its
+#                prefix (btrfs-raid1 → btrfs); without: btrfs, ext4, xfs,
+#                bcachefs or zfs
+#   /home disk   btrfs, ext4 or xfs, plus a label (default "home")
+#   Data disks   a mount point (default /data); several disks → a RAID
+#                layout; one disk that already has partitions → keep it
+#                (DATA_KEEP=1, mounted as-is by UUID, its current label
+#                offered) or format it with btrfs, ext4, xfs or zfs
+#   Labels default to "data", or "tank" for a ZFS pool.
+#   Sets     FS SYS_RAID HOME_FS HOME_LABEL DATA_MNT DATA_RAID DATA_FS
+#            DATA_KEEP DATA_LABEL DATA_OLDLABEL
+#   Returns  0 next, 1 back (esc), 3 stay on this step when soon() rejects a
+#            choice real mode cannot install yet
+#   Example  step_fs
 step_fs() {
   SYS_RAID=""; HOME_FS=""; DATA_RAID=""; DATA_FS=""; DATA_KEEP=0; DATA_MNT=""; HOME_LABEL=home; DATA_LABEL=data; DATA_OLDLABEL=""
   if (( ${#MIRRORS[@]} )); then
@@ -1211,6 +1558,14 @@ step_fs() {
   fi
 }
 
+# step_boot — choose the bootloader and set BOOT.
+#   systemd-boot  UEFI only, the default
+#   grub          UEFI and legacy BIOS; handles mirrored boot partitions
+#   limine        UEFI and legacy BIOS
+#   refind        UEFI only; soon() rejects it in real mode
+#   On legacy BIOS (FW=bios) the UEFI-only entries are hidden with a warning.
+#   Returns  0 next, 1 back, 3 stay (choice not supported yet)
+#   Example  step_boot
 step_boot() {
   panel "Bootloader  (${FW^^} detected)" "$(box -t "Bootloaders" \
        "systemd-boot  Minimal and fast, lists every generation. UEFI only. ★ current default" \
@@ -1228,6 +1583,13 @@ step_boot() {
   if soon "$BOOT"; then JUMP=$CUR; return 3; fi
 }
 
+# step_enc — choose disk encryption and set ENC.
+#   luks  LUKS2 on the system disk (and its mirrors, same passphrase)
+#   zfs   ZFS native encryption; offered instead of luks when FS is zfs
+#   none  no passphrase at boot
+#   The encrypted entry is starred when HW_FORM is laptop.
+#   Returns  0 next, 1 back
+#   Example  step_enc
 step_enc() {
   local lstar=""; [[ $HW_FORM == laptop ]] && lstar=" ★ (laptop detected)"
   if [[ $FS == zfs ]]; then
@@ -1241,6 +1603,13 @@ step_enc() {
   fi
 }
 
+# step_swap — choose swap and set SWAP (size in GB; 0 = zram only).
+#   N       a swapfile of N GB; the default is the RAM size, capped at 16
+#   custom  asks for the size in GB
+#   0       zram only (compressed RAM swap), no swapfile; the only choice
+#           when FS is zfs
+#   Returns  0 next, 1 back
+#   Example  step_swap
 step_swap() {
   local def=$(( RAM_B/1000000000 < 16 ? RAM_B/1000000000 : 16 ))
   if [[ $FS == zfs ]]; then
@@ -1257,6 +1626,16 @@ step_swap() {
 # --------------------------------------------------------------------------
 # Config source and the starter-template steps
 # --------------------------------------------------------------------------
+
+# set_mode — build the step list for the chosen SOURCE and display mode.
+#   SOURCE=starter   asks user, region, desktop, kernel and unfree questions
+#   SOURCE=linuxury  takes those from the cloned config and asks for secrets
+#   HUB=1            replaces the linear disk steps with a menu (step_hub) and
+#                    one step_diskconf; kernel, unfree and packages count as
+#                    visited because their defaults are valid
+#   Sets     SRC_LABEL STEPS STEP_NAMES REVIEW_IDX HEADER, and UNFREE=true when
+#            an NVIDIA GPU was detected
+#   Example  SOURCE=starter; set_mode
 set_mode() {
   if [[ $SOURCE == starter ]]; then
     SRC_LABEL="starter template"
@@ -1283,6 +1662,14 @@ set_mode() {
 }
 
 # load_config — Linuxury mode: get the config (a given checkout, or a shallow clone) and its hosts
+#   INSTALLER_REPO  use this checkout instead of cloning
+#   otherwise       git clone --depth 1 of CFG_URL into $TMP/config (reused if
+#                   already there)
+#   Each "<Host> = mkHost" block in flake.nix with a "user =" line becomes one
+#   "Host user" entry in HOSTS.
+#   Sets     REPO HOSTS
+#   Returns  1 (with a warning) when the clone fails or no hosts are found
+#   Example  load_config || return 1
 load_config() {
   if [[ -n ${INSTALLER_REPO:-} ]]; then REPO=$INSTALLER_REPO
   else
@@ -1293,6 +1680,15 @@ load_config() {
   (( ${#HOSTS[@]} )) || { warn "no hosts found in $CFG_URL"; return 1; }
 }
 
+# step_source — first step: choose where the system config comes from.
+#   starter   a fresh flake for one host, written to the new user's home
+#   linuxury  clone the existing config (load_config) and add this machine
+#   CONFIG=<file>  replay a saved answers file: read .source, load the config,
+#                  restore the answers (config_replay) and jump to the review;
+#                  on any failure CONFIG is cleared and the menu is shown
+#   INSTALL_TEST + TEST_SOURCE  override the choice in automated tests
+#   Returns  0 next, 1 back, 3 jump (replay → review; failure → this step)
+#   Example  step_source
 step_source() {
   if [[ -n $CONFIG ]]; then   # replay: no questions, straight to the review
     [[ -f $CONFIG ]] || { warn "answers file not found: $CONFIG"; CONFIG=""; JUMP=$CUR; return 3; }
@@ -1313,8 +1709,16 @@ step_source() {
   if [[ $SOURCE == linuxury ]]; then load_config || { JUMP=$CUR; return 3; }; fi
 }
 
+# step_host — name the machine: host_starter for a new host, host_linuxury to
+# pick one of the config's hosts.
+#   Example  step_host
 step_host() { if [[ $SOURCE == starter ]]; then host_starter; else host_linuxury; fi; }
 
+# host_starter — show the detected hardware and ask for a hostname (a letter,
+# then letters, digits or dashes; asked again until valid).
+#   Sets     HOST, NEWHOST=1, PROFILE (laptop or desktop, from HW_FORM)
+#   Returns  0 next, 1 back
+#   Example  host_starter
 host_starter() {
   panel "Name this computer" "$(box -t "Detected hardware" "Used to fill in the hardware settings of your starter config:" \
     "$(printf '%-9s %-26s %-9s %s' CPU "$HW_CPU + microcode" GPU "$HW_GPU")" \
@@ -1328,6 +1732,13 @@ host_starter() {
   NEWHOST=1; PROFILE=$([[ $HW_FORM == laptop ]] && echo laptop || echo desktop)
 }
 
+# step_user — starter mode: the admin account and SSH.
+#   NIXUSER  lowercase letter, then up to 30 lowercase letters, digits or
+#            dashes; "root" is refused; asked again until valid
+#   SSH      false (default) or true to enable the OpenSSH server
+#   The password is set at the end of the install, not stored in the config.
+#   Returns  0 next, 1 back
+#   Example  step_user
 step_user() {
   panel "Your account" "$(box -t "Account" \
     "The first user is an administrator (can use sudo)." \
@@ -1341,6 +1752,15 @@ step_user() {
   pick SSH "Remote login (SSH)" "No   recommended unless you need it|false" "Yes  log in from another computer|true" || return 1
 }
 
+# step_region — starter mode: timezone and keyboard layout.
+#   TZONE   a listed tz database name, or "Other…" to type one (letters,
+#           digits, _ + / -); `timedatectl list-timezones` lists them all
+#   KEYMAP  console keymap (console.keyMap), e.g. us, de-latin1
+#   XKB     desktop layout (services.xserver.xkb.layout), e.g. us, gb
+#   Menu values are "keymap:xkb" pairs because the two names differ
+#   (uk:gb, la-latin1:latam); "Other…" asks for each name.
+#   Returns  0 next, 1 back
+#   Example  step_region
 step_region() {
   panel "Region" "$(box -t "Timezone and keyboard" \
     "The timezone sets the clock. The keyboard layout is used at the login screen and in the terminal." \
@@ -1365,6 +1785,16 @@ step_region() {
   else KEYMAP=${kb%%:*}; XKB=${kb##*:}; fi
 }
 
+# step_desktop — starter mode: choose the desktop stack and set DESKTOP.
+#   none    text login only (default)
+#   gnome   stacks/gnome.nix
+#   kde     stacks/kde.nix (Plasma 6)
+#   cosmic  stacks/cosmic.nix
+#   The chosen stack's import is uncommented in the host file (stack_mark);
+#   the others stay commented so switching later is one line.
+#   INSTALL_TEST + TEST_DESKTOP  override the choice in automated tests
+#   Returns  0 next, 1 back
+#   Example  step_desktop
 step_desktop() {
   panel "Desktop" "$(box -t "Desktop stacks" \
     "None        Text login only. Good for servers, or if you will build your own desktop." \
@@ -1376,8 +1806,16 @@ step_desktop() {
   if [[ -n ${INSTALL_TEST:-} && -n ${TEST_DESKTOP:-} ]]; then DESKTOP=$TEST_DESKTOP; fi
 }
 
+# kernel_attr KEY — the nixpkgs package set for a kernel choice.
+#   latest → linuxPackages_latest, zen → linuxPackages_zen, anything else →
+#   linuxPackages (the LTS default)
+#   Example  kernel_attr zen   # prints linuxPackages_zen
 kernel_attr() { case $1 in latest) echo linuxPackages_latest ;; zen) echo linuxPackages_zen ;; *) echo linuxPackages ;; esac; }
 # kernel_version KEY — the Linux version that choice has in the nixpkgs the new system will be locked to ("" if offline)
+#   Evaluates github:NixOS/nixpkgs/<nixpkgs_channel>#<attr>.kernel.version
+#   once per KEY and caches it in KVER ("-" marks a failed lookup, so it is
+#   not retried).
+#   Example  kernel_version latest   # e.g. 6.17.8
 kernel_version() {
   local k=$1 v
   if [[ -z ${KVER[$k]:-} ]]; then
@@ -1387,12 +1825,25 @@ kernel_version() {
   if [[ ${KVER[$k]} != - ]]; then echo "${KVER[$k]}"; fi
 }
 # kernel_label — short form for the menu and review, e.g. "7.3.3 latest"
+#   Uses KERNEL, or "default (ZFS)" when FS is zfs; the version is left out
+#   when offline.
+#   Example  kernel_label
 kernel_label() {
   local k=$KERNEL v z=""
   if [[ ${FS:-} == zfs ]]; then k=default; z=" (ZFS)"; fi
   v=$(kernel_version "$k")
   echo "${v:+$v }$k$z"
 }
+
+# step_kernel — starter mode: choose the kernel and set KERNEL.
+#   default  linuxPackages, long-term support
+#   latest   linuxPackages_latest, newest stable
+#   zen      linuxPackages_zen, desktop-tuned
+#   Each entry shows the version from kernel_version. With FS=zfs only
+#   "default" is offered.
+#   INSTALL_TEST + TEST_KERNEL  override the choice in automated tests
+#   Returns  0 next, 1 back
+#   Example  step_kernel
 step_kernel() {
   local vd vl vz
   printf '  checking the kernel versions …\r' >"$TTY"
@@ -1411,6 +1862,14 @@ step_kernel() {
   pick KERNEL "" "Default ★   ${vd:+$vd · }long-term support|default" "Latest      ${vl:+$vl · }newest stable|latest" "Zen         ${vz:+$vz · }desktop-tuned|zen" || return 1
   if [[ -n ${INSTALL_TEST:-} && -n ${TEST_KERNEL:-} ]]; then KERNEL=$TEST_KERNEL; fi
 }
+
+# step_unfree — starter mode: set UNFREE (nixpkgs.config.allowUnfree).
+#   false  free software only (default)
+#   true   allow unfree packages; the only choice when an NVIDIA GPU was
+#          detected, because its driver is unfree
+#   INSTALL_TEST + TEST_UNFREE  override the choice in automated tests
+#   Returns  0 next, 1 back
+#   Example  step_unfree
 step_unfree() {
   if [[ $HW_GPU == *NVIDIA* ]]; then
     panel "Unfree software" "$(box -t "Unfree software" "Your NVIDIA graphics card needs its proprietary driver, so unfree software is allowed.")"
@@ -1426,6 +1885,15 @@ step_unfree() {
   if [[ -n ${INSTALL_TEST:-} && -n ${TEST_UNFREE:-} ]]; then UNFREE=$TEST_UNFREE; fi
 }
 
+# step_secrets — linuxury mode: create the new host's SSH host key so agenix
+# secrets can be re-keyed for it.
+#   Generates $KEYDIR/ssh_host_ed25519_key once (ed25519, no passphrase,
+#   comment root@HOST); KEYDIR lives outside TMP so --resume keeps the key.
+#   Shows the public key as an add-host command and as a QR code (qrencode).
+#   SECRETS  done  add-host was run; the re-keyed secrets are pulled
+#            skip  install anyway; secrets fail to decrypt until re-keyed
+#   Returns  0 next, 1 back
+#   Example  step_secrets
 step_secrets() {
   mkdir -p "$KEYDIR"; chmod 700 "$KEYDIR"
   [[ -f $KEYDIR/ssh_host_ed25519_key ]] || ssh-keygen -q -t ed25519 -N "" -C "root@$HOST" -f "$KEYDIR/ssh_host_ed25519_key"
@@ -1439,6 +1907,10 @@ step_secrets() {
   pick SECRETS "" "I ran add-host — pull the re-keyed secrets|done" "Skip — secrets fail until re-keyed later (docs/06)|skip" || return 1
 }
 
+# other_action ROLE — plain words for what happens to a disk that is not
+# formatted (role boot, mount-ro, mount-rw or boot+mount-ro); any other value
+# is printed as-is.
+#   Example  other_action mount-rw   # prints "mounted read-write"
 other_action() {  # boot+mount-ro → "in boot menu + mounted read-only"
   case $1 in
     boot) echo "in boot menu" ;; mount-ro) echo "mounted read-only" ;; mount-rw) echo "mounted read-write" ;;
@@ -1446,6 +1918,19 @@ other_action() {  # boot+mount-ro → "in boot menu + mounted read-only"
   esac
 }
 
+# planned — the disk list after the install, for the review screen.
+# Takes DISKS and the answers (SYS MIRRORS HOME_DISK DATA OTHER FS ENC FW ...)
+# and prints a JSON array with one object per disk:
+#   name size  as in DISKS
+#   segs       the partitions after the install; each has .purpose (what it is
+#              used for, "not mounted" by default)
+#   action     coloured label: WIPE (system, mirror, /home, formatted data),
+#              keep (data disk kept by UUID; shows a label change if any),
+#              or other_action's text for other disks
+#   same       true when the disk is not changed at all
+# System and mirror disks get a 1 GiB EFI partition + root on UEFI, or a
+# 1 MiB bios_grub area + root on BIOS; root shows as luks+FS when encrypted.
+#   Example  planned | jq '.[] | select(.same == false) | .name'
 planned() {  # DISKS + choices → same JSON shape; .segs = new layout (with .purpose), .action, .same
   local n p=() fsl sz segs act o same rootp dd
   fsl=$([[ $ENC == luks ]] && echo "luks+$FS" || echo "$FS")
@@ -1493,6 +1978,12 @@ planned() {  # DISKS + choices → same JSON shape; .segs = new layout (with .pu
 
 # review_cards BEFORE AFTER — one framed card per disk, frame + status coloured by
 # what happens to it (red WIPE · green keep · gray untouched · blue other OS)
+#   BEFORE  the DISKS JSON as scanned
+#   AFTER   planned's output
+#   Unchanged disks list their partitions once; changed disks show "now" and
+#   "after" rows, the after rows with their purpose. A SMART warn/fail status
+#   is added to the card title.
+#   Example  review_cards "$DISKS" "$(planned)"
 review_cards() {
   local before=$1 after=$2 n s t m h o act same i d l f z u tree fc st title
   local -a LS RS rows
@@ -1532,6 +2023,10 @@ review_cards() {
   done < <(jq -r '.[] | [.name, .size, .tran, .model, .smart, .os] | map(tostring) | join("\u001f")' <<<"$before")
 }
 
+# review_summary AFTER — one line listing every change in planned's output:
+# wiped disks, kept disks with their mount point, other changed disks with
+# their action, and a count of untouched disks.
+#   Example  review_summary "$(planned)"
 review_summary() {  # "Changes: wipe nvme0n1 · keep sda → /data · 1 untouched"
   jq -r '[.[] | (.action | gsub("\u001b\\[[0-9;]*m"; "")) as $a
           | if ($a|startswith("WIPE")) then "wipe \(.name)"
@@ -1541,12 +2036,16 @@ review_summary() {  # "Changes: wipe nvme0n1 · keep sda → /data · 1 untouche
         | "Changes: " + (($c + (if $u > 0 then ["\($u) untouched"] else [] end)) | join(" · "))' <<<"$1"
 }
 
-# panel_box "Title" "line"… — fixed-width box so two sit side by side
+# enc_label — ENC as shown in the review: none, LUKS2 or ZFS native.
+#   Example  enc_label
 enc_label() {
   case $ENC in none) echo none ;; luks) echo "LUKS2" ;; *) echo "ZFS native" ;; esac
 }
 
 # panel_box WIDTH "Title" "label value"… — lines longer than the box get "…", never wrap
+#   A fixed-width gum box (rounded border, bold title) so two can sit side by
+#   side in the review.
+#   Example  panel_box 40 "System" "Host    $HOST" "Boot    $BOOT"
 panel_box() {
   local LC_ALL=C.UTF-8 w=$1 t=$2 l out=(); shift 2
   for l; do (( ${#l} > w - 4 )) && l="${l:0:$(( w - 5 ))}…"; out+=("$l"); done
@@ -1554,11 +2053,23 @@ panel_box() {
     "$(gum style --bold --foreground 212 "$t")" "${out[@]}"
 }
 
+# review_last — the last review line: SSH on/off for a starter config, or
+# whether secrets were re-keyed in linuxury mode.
+#   Example  review_last
 review_last() {
   if [[ $SOURCE == starter ]]; then echo "Config  starter flake, SSH $([[ $SSH == true ]] && echo on || echo off)"
   else echo "Secrets $([[ $SECRETS == "done" ]] && echo "re-keyed ✓" || echo "skipped")"; fi
 }
 
+# review_warnings — print one warning per risk in the current answers:
+#   - a SMART warn/fail on any disk that will be used
+#   - ZFS holding the kernel back
+#   - a laptop without encryption
+#   - secrets skipped in linuxury mode
+#   - a btrfs system mirror (boot once with -o degraded after a disk dies)
+#   - another OS on a disk that is kept, with what happens to it
+#   Prints "✓ No warnings" when the list is empty.
+#   Example  review_warnings
 review_warnings() {
   local w=() n s
   for n in "$SYS" "${MIRRORS[@]}" "${DATA[@]}" ${HOME_DISK:+"$HOME_DISK"}; do
@@ -1573,8 +2084,17 @@ review_warnings() {
   if (( ${#w[@]} == 0 )); then echo "${G}✓ No warnings${N}"; else printf "${Y}⚠ %s${N}\n" "${w[@]}"; fi
 }
 
-# ---- main menu (prototype) --------------------------------------------------
+# ---- main menu (HUB=1) -----------------------------------------------------
+# HUB=1 shows a menu of sections (step_hub) instead of a linear walk; each
+# section runs its step and returns to the menu.
+
+# hub_section STEP — true when STEP is a menu entry (not source, the menu
+# itself or the review).
+#   Example  hub_section step_user && echo listed
 hub_section() { [[ $1 != step_source && $1 != step_hub && $1 != step_review ]]; }
+
+# hub_label STEP — the menu name of a section; empty for other steps.
+#   Example  hub_label step_diskconf   # prints "Disk configuration"
 hub_label() {
   case $1 in
     step_host) echo "Hostname" ;; step_diskconf) echo "Disk configuration" ;; step_user) echo "User account" ;;
@@ -1583,6 +2103,7 @@ hub_label() {
   esac
 }
 # hub_value STEP — what that entry currently says
+#   Example  hub_value step_user   # e.g. "user · SSH off"
 hub_value() {
   case $1 in
     step_host)     echo "${HOST:-}$([[ ${NEWHOST:-0} == 1 ]] && echo " (new)" || true)" ;;
@@ -1597,6 +2118,12 @@ hub_value() {
   esac
 }
 # the disk screens depend on each other, so they run as one entry (like archinstall's "Disk configuration")
+# step_diskconf — run step_disks, step_fs, step_boot, step_enc and step_swap in
+# order as one menu section.
+#   A sub-step's 0 moves on, 3 shows that sub-step again, anything else goes
+#   back one sub-step; back from step_disks leaves the section.
+#   Returns  0 when all five are answered, 1 back to the menu
+#   Example  step_diskconf
 step_diskconf() {
   local g=(step_disks step_fs step_boot step_enc step_swap) i=0 rc
   while ((i < ${#g[@]})); do
@@ -1609,6 +2136,10 @@ step_diskconf() {
   done
 }
 # config_replay FILE — answers file → every setting; returns 1 if a saved disk is missing
+#   load_answers restores the disk answers by serial; host, user, region,
+#   desktop, kernel, unfree and ssh are read here. Every step is marked
+#   visited so the review accepts the result.
+#   Example  config_replay "$CONFIG" || echo "$LOAD_MISSING"
 config_replay() {
   local f=$1 s
   load_answers "$f" || return 1
@@ -1619,6 +2150,11 @@ config_replay() {
 }
 
 # nixpkgs search: type a word, pick from the matches (nix search is slow the first time)
+# pkg_search — ask for a word, run `nix search nixpkgs WORD --json`, and list
+# up to 25 matches: exact name first, then names starting with the word, then
+# shortest names.
+#   Returns  0 always (empty query, esc and no matches all go back quietly)
+#   Example  pkg_search
 pkg_search() {
   local q out rows=() choice
   ask q --header "Search nixpkgs" --placeholder "a program name or a word from its description" || return 0
@@ -1635,10 +2171,19 @@ pkg_search() {
   local x; for x in "${PKGS[@]}"; do [[ $x == "$choice" ]] && return 0; done
   PKGS+=("$choice")
 }
+
+# nixc ARGS… — nix with flakes and nix-command enabled for this call only, so
+# the live ISO needs no nix.conf change.
+#   Example  nixc eval --raw nixpkgs#git.outPath
 nixc() { nix --extra-experimental-features "nix-command flakes" "$@"; }
 # closure_info OUTPATH… — the binary cache's JSON for those paths and everything they depend on (download + unpacked size)
+#   nix path-info -r (recursive: the whole closure) --json against
+#   cache.nixos.org; fails when a path is not in the cache or it is offline.
+#   Example  closure_info "$(nixc eval --raw nixpkgs#git.outPath)"
 closure_info() { nixc path-info --store https://cache.nixos.org -r --json "$@" 2>/dev/null; }
 # pkg_unfree PKG — true if nixpkgs marks it unfree (asks the package's metadata, so no unfree opt-in needed)
+#   The answer is cached in PKGUNFREE; a failed lookup counts as free.
+#   Example  pkg_unfree steam && echo unfree
 pkg_unfree() {
   local v
   if [[ -z ${PKGUNFREE[$1]:-} ]]; then
@@ -1648,8 +2193,17 @@ pkg_unfree() {
   [[ ${PKGUNFREE[$1]} == 1 ]]
 }
 # unfree_picked — the selected packages that need allowUnfree
+#   Example  mapfile -t unf < <(unfree_picked)
 unfree_picked() { local p; for p in "${PKGS[@]}"; do if pkg_unfree "$p"; then echo "$p"; fi; done; }
 # pkg_cost — what the chosen packages add on top of a bare install (git + vim): sets COST_LINE and COST_PATHS
+#   Skipped when PKGS has not changed since the last run (COST_KEY).
+#   Evaluates each package's outPath (unfree allowed, --impure), then
+#   subtracts the git + vim closure (cached in $TMP/base.json) from the
+#   packages' closure and sums downloadSize of what is left.
+#   COST_LINE   one sentence: the count and MiB to download, or why the size
+#               is unknown (broken package, not in the cache, offline)
+#   COST_PATHS  store names (without hash) of the added paths
+#   Example  pkg_cost; echo "$COST_LINE"
 pkg_cost() {
   local key="${PKGS[*]:-}" p op ops=() bad=() uncached=() all res mib; local -A opof=()
   [[ $key == "$COST_KEY" ]] && return 0
@@ -1678,6 +2232,9 @@ pkg_cost() {
   COST_LINE="Together they add ${#COST_PATHS[@]} package$([[ ${#COST_PATHS[@]} == 1 ]] || echo s) and about ${mib} MiB to download."
 }
 # pkg_lines — "name  description", one per chosen package
+#   The description comes from the search results or meta.description,
+#   prefixed "unfree ·" when needed, cut to 58 characters.
+#   Example  mapfile -t pl < <(pkg_lines)
 pkg_lines() {
   local p d
   for p in "${PKGS[@]}"; do
@@ -1687,6 +2244,18 @@ pkg_lines() {
     printf '%-18s %s\n' "$p" "${d:0:58}"
   done
 }
+
+# step_packages — starter mode: extra nixpkgs packages for every user (PKGS).
+# Shows the selection, its download cost (pkg_cost) and unfree status, then:
+#   search  pkg_search adds a package
+#   unfree  sets UNFREE=true (offered when a pick needs it)
+#   deps    lists COST_PATHS, what the picks pull in
+#   remove  drops one package
+#   done    finish the step
+#   INSTALL_TEST + TEST_PKGS     preset PKGS in automated tests (no TEST_PKGS:
+#                                skip the step); TEST_PKG_IDX picks the entry
+#   Returns  0 done, 1 back
+#   Example  step_packages
 step_packages() {
   [[ -n ${INSTALL_TEST:-} && -n ${TEST_PKGS:-} && ${#PKGS[@]} -eq 0 ]] && read -ra PKGS <<<"$TEST_PKGS"   # tests only
   [[ -n ${INSTALL_TEST:-} && -z ${TEST_PKGS:-} ]] && return 0
@@ -1730,6 +2299,19 @@ step_packages() {
   done
 }
 
+# step_hub — the main menu (HUB=1): one entry per section with its current
+# value or "(not set)", the cursor on the first unanswered entry.
+#   <section>  JUMP to that step; it returns here when done
+#   save       write answers_json to ANSWERS_OUT (default ./answers.json) for
+#              `install --config FILE`
+#   go         Install: JUMP to the review; refused while a picked package
+#              needs unfree and UNFREE is off
+#   locked     Install while entries are unset: warns and stays
+#   abort      leave the alternate screen and exit 0 without changes
+#   INSTALL_TEST  picks the first unset entry, else go; TEST_VISIT opens one
+#                 named section once; TEST_HUB_SHOW shows the real menu
+#   Returns  3 always (JUMP set), or 1 on esc
+#   Example  step_hub
 step_hub() {
   local i fn val opts=() choice next="" nmiss=0 cursor=0
   for ((i = 2; i < REVIEW_IDX; i++)); do
@@ -1765,6 +2347,15 @@ step_hub() {
   return 3
 }
 
+# step_review — the last step: everything that will happen, on one screen.
+#   Top row   three panel_box panels: System (starter answers, or the chosen
+#             host's desktop/kernel/profile), Hardware, Boot & security
+#   Below     review_warnings, review_summary and review_cards for the disks
+#             listed in NAMES
+#   Install   asks to type the hostname; a mismatch stays on the review
+#   Edit      HUB=1: back to the menu; otherwise pick any earlier step
+#   Returns  0 confirmed, 1 back, 3 jump (edit or mismatch)
+#   Example  step_review
 step_review() {
   local plan; plan=$(planned)
   local shown; shown=$(jq --argjson keep "$(printf '%s\n' "${NAMES[@]}" | jq -R . | jq -s .)" '[.[] | select(.name as $n | $keep | index($n))]' <<<"$DISKS")
@@ -1820,7 +2411,38 @@ $(review_cards "$shown" "$plan")"
 # ==========================================================================
 # Output generators
 # ==========================================================================
+# Turn the answers into files and commands: gen_disk_nix writes the host's
+# disk.nix, gen_commands the shell commands that partition, format, mount
+# and install.
+
+# uefi — true when the machine booted in UEFI mode (FW=uefi), false on BIOS.
+#   Example  uefi && echo "1 GiB EFI partition"
 uefi() { [[ $FW == uefi ]]; }
+
+# gen_disk_nix — print hosts/$HOST/disk.nix for the answers, to stdout.
+# Every mount uses a label or UUID, so device names may change.
+#   Boot loader    systemd-boot; grub (efiSupport on UEFI, mirroredBoots with
+#                  one entry per system disk, useOSProber when another disk
+#                  has the boot role); limine (biosDevice on BIOS); refind.
+#                  With another OS to boot, systemd-boot gets the EDK2 UEFI
+#                  shell and limine a commented extraEntries example
+#   ESP mirror     non-GRUB loaders with mirrors on UEFI: an activation
+#                  script rsyncs /boot/ to every /bootN/
+#   LUKS           boot.initrd.luks.devices.cryptrootN on label nixos-luksN,
+#                  one per system disk, allowDiscards on
+#   Root           btrfs subvolumes @ @home @nix @log @cache @snapshots
+#                  @home_snapshots @swap (compress=zstd:1, noatime; @home*
+#                  skipped with a /home disk, @swap when SWAP=0); ZFS
+#                  datasets rpool/{root,home,nix,log} with a random
+#                  networking.hostId and the LTS kernel forced; otherwise one
+#                  filesystem on label nixos
+#   /boot          label EFI, plus EFI2… on mirrors (nofail), umask=0077
+#   /home, data    by label; a kept data disk by UUID; a ZFS data pool via
+#                  boot.zfs.extraPools; data mounts are nofail
+#   Other disks    mount roles become ntfs3 mounts at /mnt/<OS name>, ro or rw
+#   Swap           zram when SWAP=0; /swap/swapfile on btrfs; otherwise
+#                  /swapfile of SWAP GB (swapDevices size is in MiB)
+#   Example  gen_disk_nix >"$REPO/hosts/$HOST/disk.nix"
 gen_disk_nix() {
   local i n
   cat <<EOF
@@ -1928,8 +2550,25 @@ EOF
 # gen_commands — the install, as runnable lines. The demo prints them; real mode
 # runs them (run_install). "# [n/7] …" lines are phase checkpoints for --resume;
 # phase 3 (unlock + mount) is idempotent and re-runs on every resume.
+#   [1/7] partition   wipefs + a GPT on every system disk: UEFI gets a 1 GiB
+#                     ESP + root, BIOS a 1 MiB bios_grub area + root; the
+#                     ESPs are formatted FAT32 as EFI, EFI2…
+#   [2/7] format      LUKS2 (label nixos-luksN) when ENC=luks, then the root
+#                     filesystem, /home, the data disks, and a relabel of a
+#                     kept data disk
+#   [3/7] mount       unlock, mount everything under /mnt, create the btrfs
+#                     swapfile
+#   [4/7] config      write_starter, or fetch_config + write_config
+#   [5/7] secrets     linuxury mode: copy the host key; pull re-keyed secrets
+#                     when SECRETS=done
+#   [6/7] install     nixos-install --flake …#HOST --no-root-passwd, then set
+#                     the user's password with nixos-enter
+#   [7/7] finish      copy the log, fix home ownership, unmount
+#   Example  gen_commands | grep -v '^#'
 gen_commands() {
   local i n d p2 root=()
+  # System disks: GPT; parted's "esp" flag marks the EFI partition and
+  # "bios_grub" the area GRUB embeds itself in on BIOS
   echo "# [1/7] partition"
   for i in "${!SYS_DISKS[@]}"; do d=${SYS_DISKS[$i]}
     echo "wipefs -a /dev/$d && parted -s /dev/$d -- mklabel gpt"
@@ -1940,6 +2579,10 @@ gen_commands() {
   if uefi; then
     for i in "${!SYS_DISKS[@]}"; do echo "mkfs.fat -F32 -n EFI$([[ $i == 0 ]] || echo $((i+1))) $(part "${SYS_DISKS[$i]}" 1)"; done
   fi
+  # Root: luksFormat each system disk's partition 2 and open it as
+  # cryptrootN; btrfs -d/-m set the data/metadata RAID profile; zpool
+  # ashift=12 = 4 KiB sectors, compression=zstd, and ENC=zfs adds native
+  # passphrase encryption
   echo "# [2/7] encryption + filesystems"
   for i in "${!SYS_DISKS[@]}"; do d=${SYS_DISKS[$i]}; n=$((i+1)); p2=$(part "$d" 2)
     if [[ $ENC == luks ]]; then
@@ -1959,6 +2602,8 @@ gen_commands() {
     *)     echo "mkfs.$FS -f -L nixos ${root[0]}" ;;
   esac
   if [[ -n $HOME_DISK ]]; then echo "wipefs -a /dev/$HOME_DISK && $(mkfs_cmd "$HOME_FS" "$HOME_DISK" "$HOME_LABEL")"; fi
+  # Data disks (not when kept): a btrfs RAID, a ZFS pool (raid layout or one
+  # disk) with a legacy-mounted <label>/data dataset, or one mkfs_cmd
   if (( ${#DATA[@]} )) && [[ $DATA_KEEP == 0 ]]; then
     local devs l; devs=$(printf '/dev/%s ' "${DATA[@]}")
     case ${DATA_RAID:-$DATA_FS} in
@@ -1973,6 +2618,8 @@ gen_commands() {
     relabel_cmd "$DATA_FS" "$(disk "${DATA[0]}" .datadev)" "$DATA_LABEL"
   fi
   echo "udevadm settle"
+  # Every mount goes through mnt, so a resumed install can run this phase
+  # again; a ZFS data pool is not mounted here (fileSystems mounts it later)
   echo "# [3/7] unlock + mount + swap"
   if [[ $ENC == luks ]]; then
     for i in "${!SYS_DISKS[@]}"; do echo "luks_open $(part "${SYS_DISKS[$i]}" 2) cryptroot$((i+1))"; done
@@ -2012,10 +2659,14 @@ gen_commands() {
     echo "install -Dm644 $KEYDIR/ssh_host_ed25519_key.pub /mnt/etc/ssh/ssh_host_ed25519_key.pub"
     if [[ $SECRETS == "done" ]]; then echo "git -C /mnt/home/$NIXUSER/nixos-config pull --rebase   # add-host's re-keyed secrets"; fi
   fi
+  # grow_live_store lets the live ISO's RAM-backed store spill to swap on the
+  # new disk; root gets no password, the user's is asked here
   echo "# [6/7] install"
   echo "grow_live_store   # the ISO's package store lives in RAM — let it spill to swap on the new disk"
   echo "nixos-install --flake /mnt/home/$NIXUSER/nixos-config#$HOST --no-root-passwd"
   echo "nixos-enter --root /mnt -- passwd $NIXUSER"
+  # The log is kept on the new system; the starter user is the first normal
+  # user (uid 1000), a linuxury-mode user gets the uid from the config
   echo "# [7/7] finish"
   echo "cp $LOG /mnt/var/log/nixos-install.log"
   if [[ $SOURCE == starter ]]; then
@@ -2026,15 +2677,35 @@ gen_commands() {
 }
 
 # ---- helpers the command list calls ---------------------------------------
+# gen_commands prints these names; run_install runs the lines, so they must
+# be defined in this shell.
+
 # mnt OPTS DEVICE DIR — idempotent mount (re-run safely by --resume)
+#   OPTS  mount -o options, e.g. subvol=@,compress=zstd:1,noatime or zfsutil
+#   Creates DIR and skips it when something is already mounted there.
+#   Example  mnt noatime /dev/disk/by-label/nixos /mnt
 mnt() { mkdir -p "$3"; mountpoint -q "$3" || mount -o "$1" "$2" "$3"; }
+# luks_open PARTITION NAME — cryptsetup open PARTITION as /dev/mapper/NAME
+# (asks for the passphrase) unless it is already open.
+#   Example  luks_open /dev/nvme0n1p2 cryptroot1
 luks_open() { [[ -e /dev/mapper/$2 ]] || cryptsetup open "$1" "$2"; }
+# CFG_URL — the config repo for linuxury mode; INSTALLER_GIT overrides it.
 CFG_URL=${INSTALLER_GIT:-https://github.com/Linuxury/nixos-config}
+# fetch_config — full clone of CFG_URL into the user's home on the new
+# system (kept if already there) and mark it a git safe.directory, since root
+# runs git on a tree the user will own.
+#   Example  fetch_config
 fetch_config() {
   local c=/mnt/home/$NIXUSER/nixos-config
   [[ -d $c/.git ]] || git clone "$CFG_URL" "$c"
   git config --global --add safe.directory "$c" 2>/dev/null || true
 }
+# write_config — linuxury mode: add this machine to the cloned config.
+#   Writes hosts/$HOST/disk.nix (gen_disk_nix) and hosts/$HOST/install.json
+#   (answers_json) and commits them as "nixos installer".
+#   With a forwarded SSH agent (SSH_AUTH_SOCK) a github.com HTTPS remote is
+#   switched to SSH and the commit is pushed; otherwise it stays local.
+#   Example  write_config
 write_config() {
   local c=/mnt/home/$NIXUSER/nixos-config
   gen_disk_nix >"$c/hosts/$HOST/disk.nix"
@@ -2049,10 +2720,28 @@ write_config() {
   else echo "no forwarded SSH agent — the commit stays local; push it after first boot"; fi
 }
 # ---- starter template ------------------------------------------------------
+# The files under templates/starter with their @NAME@ blanks filled in.
+
+# nixpkgs_channel — the nixpkgs branch the new system follows;
+# INSTALLER_CHANNEL overrides the default nixos-unstable.
+#   Example  nixpkgs_channel
 nixpkgs_channel() { echo "${INSTALLER_CHANNEL:-nixos-unstable}"; }
+# state_version — system.stateVersion for the new host as YY.MM, from
+# INSTALLER_STATE_VERSION or the live ISO's `nixos-version --release`
+# (falls back to 26.05).
+#   Example  state_version
 state_version() { local v=${INSTALLER_STATE_VERSION:-$(nixos-version --release 2>/dev/null)}; v=$(sed -nE 's/^([0-9]{2}\.[0-9]{2}).*/\1/p' <<<"$v"); echo "${v:-26.05}"; }   # YY.MM only; the release string can carry a date and codename
+# stack_mark NAME — "" for the chosen desktop stack, "# " for the others;
+# fills @GNOME@ @KDE@ @COSMIC@ in front of each stack import.
+#   Example  stack_mark kde
 stack_mark() { [[ $DESKTOP == "$1" ]] && echo "" || echo "# "; }   # chosen stack uncommented, the others commented out
+# extra_pkgs — PKGS as " a b c" for the @EXTRA_PKGS@ list (empty if none).
+#   Example  extra_pkgs
 extra_pkgs() { if ((${#PKGS[@]})); then printf ' %s' "${PKGS[@]}"; fi; }
+# kernel_line — the @KERNEL@ line of the host file: boot.kernelPackages for
+# latest or zen with the version as a trailing note; for default, a
+# commented example so the LTS kernel stays in use.
+#   Example  kernel_line
 kernel_line() {
   local v; v=$(kernel_version "$KERNEL")
   case $KERNEL in
@@ -2062,6 +2751,10 @@ kernel_line() {
 }
 
 # starter_fill FILE — fill the @…@ blanks of a template file
+#   @HOST@ @USER@ @TZ@ @KEYMAP@ @XKB@ @SSH@ @CHANNEL@ @STATEVERSION@ @DATE@
+#   @GNOME@ @KDE@ @COSMIC@ (stack_mark) @KERNEL@ (kernel_line) @UNFREE@
+#   @EXTRA_PKGS@ (extra_pkgs); the result goes to stdout.
+#   Example  starter_fill templates/starter/host.nix >"$dir/hosts/$HOST/default.nix"
 starter_fill() {
   sed -e "s|@HOST@|$HOST|g" -e "s|@USER@|$NIXUSER|g" -e "s|@TZ@|$TZONE|g" -e "s|@KEYMAP@|$KEYMAP|g" -e "s|@XKB@|$XKB|g" \
       -e "s|@SSH@|$SSH|g" -e "s|@CHANNEL@|$(nixpkgs_channel)|g" -e "s|@STATEVERSION@|$(state_version)|g" -e "s|@DATE@|$(date +%F)|g" \
@@ -2070,6 +2763,15 @@ starter_fill() {
 }
 
 # gen_hardware_nix — CPU, GPU, laptop and VM settings from what detect_hw found
+#   always       hardware.enableRedistributableFirmware
+#   AMD / Intel  hardware.cpu.<vendor>.updateMicrocode
+#   any GPU      hardware.graphics.enable
+#   NVIDIA       allowUnfree, the nvidia video driver, modesetting, the
+#                closed kernel module (open = true suits RTX 20 and newer);
+#                a hybrid GPU (HW_GPU contains "+") gets a PRIME note
+#   laptop       services.power-profiles-daemon
+#   VM           services.qemuGuest
+#   Example  gen_hardware_nix >"$dir/hosts/$HOST/hardware.nix"
 gen_hardware_nix() {
   cat <<EOF
 # Hardware settings for $HOST found by the installer on $(date +%F): $HW_CPU CPU, $HW_GPU GPU, $HW_FORM.
@@ -2101,6 +2803,10 @@ EOF
 }
 
 # emit_starter DIR — every file of the starter flake except hardware-configuration.nix
+#   flake.nix, README.md and hosts/HOST/default.nix from the templates
+#   (starter_fill), stacks/*.nix copied as-is, and hosts/HOST/disk.nix and
+#   hardware.nix generated.
+#   Example  emit_starter "$TMP/preview"
 emit_starter() {
   local c=$1 h=hosts/$HOST f
   mkdir -p "$c/$h" "$c/stacks"
@@ -2111,6 +2817,11 @@ emit_starter() {
   gen_disk_nix >"$c/$h/disk.nix"
   gen_hardware_nix >"$c/$h/hardware.nix"
 }
+# write_starter — starter mode: emit_starter into the user's home on the new
+# system, add hardware-configuration.nix from
+# `nixos-generate-config --no-filesystems` (disk.nix already has the mounts),
+# then git init -b main and make the first commit.
+#   Example  write_starter
 write_starter() {
   local c=/mnt/home/$NIXUSER/nixos-config
   emit_starter "$c"
@@ -2120,6 +2831,8 @@ write_starter() {
   git -C "$c" add -A
   git -C "$c" -c user.name="nixos installer" -c user.email="installer@$HOST" commit -q -m "$HOST: initial configuration from the NixOS installer"
 }
+# finish_starter — commit the flake.lock that nixos-install created, if any.
+#   Example  finish_starter
 finish_starter() {
   local c=/mnt/home/$NIXUSER/nixos-config
   if [[ -f $c/flake.lock ]]; then
@@ -2131,6 +2844,10 @@ finish_starter() {
 # grow_live_store — the live ISO keeps /nix/store in a RAM disk (half of RAM).
 # Evaluating the flake copies the whole repo (wallpapers included) into it, so
 # a small-RAM machine runs out. Swap on the target + a bigger RAM disk fixes it.
+#   Uses the btrfs /mnt/swap/swapfile if one was made, else creates an 8 GB
+#   /mnt/.installer-swap (btrfs mkswapfile, or fallocate + mkswap), swaps on,
+#   and when / is a tmpfs remounts it at RAM + 8 GB.
+#   Example  grow_live_store
 grow_live_store() {
   local sw=/mnt/swap/swapfile
   if [[ ! -e $sw ]]; then
@@ -2147,6 +2864,8 @@ grow_live_store() {
 }
 
 # disk_byid DISK — stable /dev/disk/by-id path (GRUB/Limine on BIOS need one)
+#   Skips partition, wwn- and nvme-eui. links; falls back to /dev/DISK.
+#   Example  disk_byid sda   # e.g. /dev/disk/by-id/ata-Samsung_SSD_870_…
 disk_byid() {
   local l
   for l in /dev/disk/by-id/*; do
@@ -2156,13 +2875,20 @@ disk_byid() {
   echo "/dev/$1"
 }
 # disk_busy DISK — true if anything on it is mounted (never wipe a live disk)
+#   Example  disk_busy sda && echo "in use"
 disk_busy() { lsblk -nro MOUNTPOINTS "/dev/$1" 2>/dev/null | grep -q .; }
 # run_now CMD… — run immediately (disk tools), logged
+#   Each CMD is a string run with eval; output goes to $LOG. Stops at the
+#   first failure with a warning and returns 1.
+#   Example  run_now "wipefs -a /dev/sdb" "mkfs.ext4 -F -L data /dev/sdb"
 run_now() {
   local c
   for c; do echo "\$ $c" >>"$LOG"; eval "$c" >>"$LOG" 2>&1 || { warn "failed: $c (see $LOG)"; return 1; }; done
 }
 
+# save_state — write every answer to $STATE as `declare -p` lines, so
+# --resume can source them and continue without the menus.
+#   Example  save_state
 save_state() {
   declare -p HOST NIXUSER NEWHOST PROFILE SYS MIRRORS HOME_DISK DATA OTHER FS SYS_RAID HOME_FS HOME_LABEL \
     DATA_RAID DATA_FS DATA_KEEP DATA_MNT DATA_LABEL DATA_OLDLABEL BOOT ENC SWAP SECRETS FW DISKS NAMES LAYOUT \
@@ -2170,6 +2896,12 @@ save_state() {
 }
 
 # preflight — refuse anything that could hurt a running system
+#   - must run as root
+#   - must run on the NixOS live ISO (/iso exists); INSTALL_ALLOW_NON_ISO=1
+#     skips this check, for VM testing only
+#   - no system, /home or to-be-formatted data disk may have anything mounted
+#   Returns  1 with a message on the first failed check
+#   Example  preflight || exit 1
 preflight() {
   local d bad=()
   [[ $EUID == 0 ]] || { echo "${R}✗ the installer must run as root (sudo)${N}"; return 1; }
@@ -2183,6 +2915,12 @@ preflight() {
 }
 
 # run_install — execute gen_commands phase by phase; checkpoint after each phase
+#   The last finished phase is written to $PHASEF. With --resume, phases up
+#   to that number are skipped, except phase 3 (unlock + mount), which every
+#   later phase needs. Lines that read the keyboard (cryptsetup, luks_open,
+#   passwd) get /dev/tty; all others get /dev/null as stdin and are logged.
+#   Returns  0 when all 7 phases ran, 1 after install_failed
+#   Example  run_install || exit 1
 run_install() {
   local line ph=0 done_ph=0 skip=0
   [[ -n $RESUME && -f $PHASEF ]] && done_ph=$(<"$PHASEF")
@@ -2208,6 +2946,9 @@ run_install() {
   done 3< <(gen_commands)
   echo 7 >"$PHASEF"
 }
+# install_failed LINE — print the failed command, the log path and how to
+# --resume; adds a hint when the live ISO's RAM disk is full.
+#   Example  install_failed "nixos-install --flake …"
 install_failed() {
   echo; echo "${R}✗ failed:${N} $1"
   echo "  Log: $LOG"
@@ -2218,6 +2959,11 @@ install_failed() {
   fi
 }
 
+# checklist — the first-boot to-do list from $REPO/docs/06-first-boot.md:
+# the "## All Machines" section's ### steps plus the steps under a ## heading
+# that names HOST. Secret steps are ticked when SECRETS=done; the password
+# step notes the primary user is done.
+#   Example  checklist
 checklist() {  # post-install steps for this host, straight from docs/06
   awk -v host="$HOST" -v sec="$SECRETS" '
     /^## / { s = ($0 ~ /^## All Machines/) ? "all" : ((host != "" && index($0, host)) ? "host" : ""); if (s == "host") print "\n" substr($0, 4); next }
@@ -2230,6 +2976,13 @@ checklist() {  # post-install steps for this host, straight from docs/06
 # ==========================================================================
 # Main
 # ==========================================================================
+# Detect hardware and disks, ask the steps, then install (real mode) or
+# show what would be done (--demo), and print the after-install notes.
+
+# Hardware from sysfs (detect_hw; TEST_FW overrides uefi/bios in tests),
+# then disks: fake scenarios (--fake-disks) or the real disks with SMART data
+# each. The ISO's own boot device, USB and removable disks are hidden from the
+# disk steps.
 detect_hw
 if [[ -n ${INSTALL_TEST:-} && -n ${TEST_FW:-} ]]; then FW=$TEST_FW; fi   # tests: pretend to boot as uefi or bios
 if [[ -n $FAKE ]]; then ALL=$(fake_disks "$FAKE" | norm)
@@ -2248,6 +3001,9 @@ SECRETS=skip
 # Saved answers are per disk set — keep fake scenarios apart from real disks
 [[ -n $FAKE ]] && ANSWERS_DIR+="/$FAKE"
 
+# Demo without root: offer to re-exec under sudo for SMART data. Real mode
+# without root: re-exec under sudo, keeping the SSH agent and installer
+# variables.
 MODE_TAG=$([[ -n $DEMO ]] && echo DEMO || echo INSTALL)
 HEADER=$(banner)
 # alternate screen + hidden cursor: menus don't litter scrollback
@@ -2282,6 +3038,8 @@ if [[ -n $RESUME ]]; then   # skip the menus: same answers, continue the install
   exit 1
 fi
 
+# The step loop: run STEPS[CUR] and move by its return code (0 next or back
+# to the menu, 3 jump to JUMP, anything else back one step or to the menu).
 while (( CUR < ${#STEPS[@]} )); do
   rc=0; fn=${STEPS[CUR]}; "$fn" || rc=$?
   case $rc in
@@ -2296,6 +3054,8 @@ while (( CUR < ${#STEPS[@]} )); do
 done
 if ((ALT)); then tput cnorm; tput rmcup; ALT=0; fi
 
+# Real mode: preflight, save the answers for --resume, clear the phase
+# checkpoint and install. Both modes then save the answers to ANSWERS_DIR.
 SYS_DISKS=("$SYS" "${MIRRORS[@]}")
 if [[ -z $DEMO ]]; then   # ---- the real install
   preflight || exit 1
@@ -2306,6 +3066,9 @@ fi
 if mkdir -p "$ANSWERS_DIR" && answers_json > "$ANSWERS_DIR/$HOST.json" 2>/dev/null; then
   [[ -n ${SUDO_UID:-} ]] && chown -R "$SUDO_UID" "/tmp/install-demo-answers-$OWNER_UID" 2>/dev/null
 else echo "${Y}⚠ could not save answers to $ANSWERS_DIR (continuing)${N}"; fi
+# The closing screen. Demo: show the generated files and the command list.
+# Both modes: what was written, where the log is, how to resume; linuxury
+# mode adds the first-boot checklist.
 if [[ $SOURCE == starter ]]; then
   if [[ -n $DEMO ]]; then
     OUT=${STARTER_OUT:-$TMP/starter}; emit_starter "$OUT"
