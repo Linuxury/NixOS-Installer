@@ -1619,7 +1619,13 @@ step_swap() {
     panel "Swap  (RAM $(hsize "$RAM_B"))"
     pick SWAP "" "${def}G swapfile ★   (RAM, capped at 16G — hibernate needs ≥ RAM)|$def" \
       "Custom size|custom" "zram only   compressed RAM swap, no disk swap|0" || return 1
-    if [[ $SWAP == custom ]]; then ask SWAP --header "Swapfile size in GB" --value "$def" || return 1; fi
+    if [[ $SWAP == custom ]]; then
+      while :; do
+        ask SWAP --header "Swapfile size in GB (whole number)" --value "$def" || return 1
+        [[ $SWAP =~ ^[1-9][0-9]*$ ]] && break
+        warn "enter a whole number of GB, e.g. 8"
+      done
+    fi
   fi
 }
 
@@ -2338,7 +2344,7 @@ step_hub() {
               warn "${unf[*]} needs unfree software. Turn on \"Unfree software\" or remove it from the packages."; JUMP=$CUR
             else JUMP=$REVIEW_IDX; fi ;;
     locked) warn "Install is locked: ${nmiss} entries still say (not set)."; JUMP=$CUR ;;
-    save)   if ((missing)); then warn "Answer every entry first, then save."
+    save)   if ((nmiss)); then warn "Answer every entry first, then save."
             else local f=${ANSWERS_OUT:-$PWD/answers.json}; answers_json >"$f"; NOTE+="${G}✓ saved $f — replay with: install --config $f${N}"$'\n'; fi
             JUMP=$CUR ;;
     abort)  ((ALT)) && { tput cnorm; tput rmcup; } 2>/dev/null; ALT=0; echo "aborted, nothing was changed"; exit 0 ;;
@@ -2463,11 +2469,20 @@ EOF
            if uefi; then echo '  boot.loader.grub.efiSupport = true;'; echo '  boot.loader.efi.canTouchEfiVariables = true;'; fi
            if (( ${#MIRRORS[@]} )); then
              echo '  boot.loader.grub.mirroredBoots = ['
-             for i in "${!SYS_DISKS[@]}"; do
-               n=$((i+1))
-               if uefi; then echo "    { path = \"/boot$([[ $n == 1 ]] || echo $n)\"; devices = [ \"nodev\" ]; }"
-               else echo "    { path = \"/boot\"; devices = [ \"$(disk_byid "${SYS_DISKS[$i]}")\" ]; }"; fi
-             done; echo '  ];'
+             if uefi; then
+               # UEFI: one ESP per disk, mounted at /boot, /boot2, …
+               for i in "${!SYS_DISKS[@]}"; do
+                 n=$((i+1))
+                 echo "    { path = \"/boot$([[ $n == 1 ]] || echo $n)\"; devices = [ \"nodev\" ]; }"
+               done
+             else
+               # BIOS: a single /boot; GRUB goes into every disk's MBR. Paths
+               # must be unique, so all disks share one entry.
+               printf '    { path = "/boot"; devices = ['
+               for i in "${!SYS_DISKS[@]}"; do printf ' "%s"' "$(disk_byid "${SYS_DISKS[$i]}")"; done
+               echo ' ]; }'
+             fi
+             echo '  ];'
            elif uefi; then echo '  boot.loader.grub.device = "nodev";'
            else echo "  boot.loader.grub.device = \"$(disk_byid "$SYS")\";"; fi
            if [[ " ${OTHER[*]} " == *"|boot"* ]]; then echo '  boot.loader.grub.useOSProber = true;   # adds the other-OS disk(s) to the menu'; fi ;;
@@ -3101,7 +3116,7 @@ else
   fi
   echo; gum style --bold --foreground 212 "After install"
   printf '  %-8s %s\n' \
-    "Wrote" "hosts/$HOST/disk.nix + hosts/$HOST/install.json$([[ $NEWHOST == 1 ]] && echo " + hosts/$HOST/$HOST.nix + flake.nix entry" || true) (git commit)" \
+    "Wrote" "hosts/$HOST/disk.nix + hosts/$HOST/install.json (git commit)$([[ $NEWHOST == 1 ]] && echo "; still to add by hand: hosts/$HOST/$HOST.nix + its flake.nix entry" || true)" \
     "Log" "/tmp/nixos-install.log → /mnt/var/log/nixos-install.log" \
     "Resume" "a failed phase continues with: --resume (no re-partitioning)" \
     "Saved" "answers in install.json — next reinstall of $HOST is one keypress" \
